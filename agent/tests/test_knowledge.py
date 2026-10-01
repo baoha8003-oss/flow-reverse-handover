@@ -70,6 +70,14 @@ def test_the_budget_is_shared_not_raced_for(task):
         pytest.skip("fairness is meaningless with one source")
     sizes = _per_file_bytes(knowledge.sections_for(task))
     assert sizes, "nothing was assembled"
+    # The cap applies only when the budget actually BINDS. The docstring above
+    # says "while others are waiting behind it", and the assertion used to drop
+    # that clause: with four sources where three are small, the fourth can pass
+    # half the budget without anyone being cut, and the whole set still fits.
+    # Measured case that exposed it: 13091 + 2390 + 6380 + 2618 = 24479 of
+    # 25000 — nothing was rationed, so there was nobody to be unfair to.
+    if sum(sizes) < knowledge.DEFAULT_BUDGET_BYTES:
+        return
     assert max(sizes) <= knowledge.DEFAULT_BUDGET_BYTES // 2, (
         f"{task}: one source took {max(sizes)}B of "
         f"{knowledge.DEFAULT_BUDGET_BYTES}B while {len(sizes) - 1} others waited"

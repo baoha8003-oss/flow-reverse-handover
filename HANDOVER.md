@@ -113,9 +113,37 @@ hiện là **tài khoản của người dùng**.
 
 ## Trạng thái đo được lúc bàn giao (02/10/2026)
 
-- backend **2811 test passed** + 2 lỗi chỉ xảy ra trên POSIX + 2 skip
+- backend **2810 test passed · 3 failed · 2 skipped**
 - frontend **230 test passed**, `tsc` sạch, `vite build` sạch
 - `ruff check .` sạch
 - đột biến: 6 bộ runner trong `agent/tools/mutations/` và `frontend/tools/mutations/`
 
 Chạy test cần đúng interpreter trong `agent/.venv` — xem `.claude/.ckignore` để biết vì sao.
+
+### Ba test đỏ, và vì sao để nguyên
+
+Không che, vì mỗi cái nói một điều khác nhau.
+
+**Hai cái chỉ đỏ trên Windows** — `test_llm_gemini::test_run_attachments_use_absolute_paths` và
+`test_llm_secrets::test_write_sets_mode_0600`. Cái thứ hai đòi quyền file `0o600`; Windows trả `0o666`.
+Chúng xanh trên POSIX/CI.
+
+**Một cái là lỗ thật, và nó đang làm đúng việc của nó** —
+`test_canvas_catalog::test_every_incoming_socket_a_packaged_workflow_uses_is_accepted`:
+
+```
+5.json: video.end_frame — node "video" không có cổng vào "end_frame"
+```
+
+Một file workflow trên máy có dây vào cổng `end_frame`, mà catalogue không nhận cổng đó. **Đừng vá
+bằng cách thêm cổng vào catalogue.** Đã kiểm: `pipeline_executor` **không có đường nào** từ dây
+`end_frame` tới tham số `end_media_id` của `gen_video`. Thêm cổng sẽ làm canvas **nhận một dây không
+nối vào đâu** — clip âm thầm mất ảnh cuối và render thành image-to-video thường. Đó đúng lớp lỗi
+"đọc như đã cấu hình mà âm thầm không làm gì" mà cả dự án này đi bắt.
+
+Muốn đóng lỗ này thì phải nối xuyên: cổng → executor → `end_media_id` → `nprQif` (Omni first+last).
+Làn Veo thì vẫn từ chối, vì payload ảnh-cuối của Veo chưa ai capture được.
+
+**Lưu ý cho người tiếp nhận:** test này đọc thư mục workflow **ngoài repo** (của bản tool đã cài), nên
+kết quả phụ thuộc máy. Trên máy khác nó có thể xanh — không phải vì lỗ đã hết, mà vì không có file nào
+dùng cổng đó. Lượt chạy đầu phiên hôm nay nó còn xanh; nó đỏ sau khi thư mục workflow đổi.
