@@ -23,7 +23,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from flowboard.services.llm import registry, secrets
+from flowboard.services.llm import cli_auth, registry, secrets
 from flowboard.services.llm.base import LLMError
 from flowboard.services import claude_cli
 
@@ -51,10 +51,32 @@ class _ConfigBody(BaseModel):
 # secrets.json with garbage values is tolerated by `read_active_providers`,
 # but the HTTP surface must reject input that wouldn't route anywhere.
 _VALID_PROVIDER_NAMES = {"claude", "gemini", "openai"}
+# Providers with a REST mode that a pasted key unlocks. Claude is CLI-only in
+# this build, so it stays out.
+_API_KEY_PROVIDERS = {"openai", "gemini"}
 _VALID_FEATURES = ("auto_prompt", "vision", "planner")
 
 
 # ── GET /api/llm/providers ────────────────────────────────────────────
+
+
+async def _auth_mode_of(provider) -> str:
+    """Which identity a provider is signed in with.
+
+    CLI providers answer for themselves. Providers without an `auth_mode`
+    are key-based by construction, so their identity follows from whether
+    a key is configured — there is no third state to discover.
+    """
+    probe = getattr(provider, "auth_mode", None)
+    if callable(probe):
+        try:
+            return await probe()
+        except Exception:
+            logger.warning(
+                "llm: auth probe failed for %s", provider.name, exc_info=True
+            )
+            return cli_auth.NONE
+    return cli_auth.APIKEY if await provider.is_available() else cli_auth.NONE
 
 
 @router.post("/debug/reset-probe")
@@ -63,6 +85,23 @@ async def debug_reset_probe() -> dict:
     claude_cli.reset_availability_cache()
     available = await claude_cli.is_available(force=True)
     return {"ok": True, "claude_available": available}
+
+
+@router.post("/recheck")
+async def recheck_providers() -> list[dict]:
+    """Drop every cached probe and report fresh provider state.
+
+    Exists for the moment right after `codex login` / `claude auth login`:
+    the caches hold for 60 seconds, and a user who has just signed in and
+    still sees "API key" on the card concludes the sign-in failed. This
+    makes the panel agree with reality immediately.
+    """
+    claude_cli.reset_availability_cache()
+    for provider in registry.list_providers():
+        reset = getattr(provider, "reset_cache", None)
+        if callable(reset):
+            reset()
+    return await list_providers()
 
 
 @router.get("/providers")
@@ -76,33 +115,171 @@ async def list_providers() -> list[dict]:
     """
     out: list[dict] = []
     for provider in registry.list_providers():
+        auth = await _auth_mode_of(provider)
         # CLI providers: available implies configured. API providers:
         # `configured` means a key exists; `available` adds "key works"
         # via the cached probe. Splitting the two lets the UI distinguish
         # "user has set things up but the key is bad" from "user hasn't
         # set anything up yet".
         available = await provider.is_available()
+        # Ask the provider which transport it would actually use. Hardcoding
+        # "cli" for everything but OpenAI made the Settings card claim a CLI
+        # login for Gemini even when it was dispatching through an API key.
+        mode = getattr(provider, "mode", None) or "cli"
         if provider.name == "openai":
-            mode = provider.mode  # type: ignore[attr-defined]
             configured = (
                 bool(secrets.get_api_key("openai"))
                 or getattr(provider, "_cli_available", False)
             )
             requires_key = False  # CLI path doesn't require it
         else:
-            mode = "cli"
             configured = available
             requires_key = False
 
-        out.append({
+        entry = {
             "name": provider.name,
             "supportsVision": provider.supports_vision,
             "available": available,
             "configured": configured,
             "requiresKey": requires_key,
             "mode": mode,
-        })
+            "authMode": auth,
+        }
+        # The binary answers but nobody is signed in. Both UI branches for
+        # this already existed (ProviderCard's "Not signed in", the setup
+        # panel's login guidance) and were unreachable, because no route
+        # ever emitted `lastError`.
+        if available and mode == "cli" and auth == cli_auth.NONE:
+            entry["lastError"] = "not_authenticated"
+        out.append(entry)
     return out
+
+
+# ── GET /api/llm/health ───────────────────────────────────────────────
+
+
+@router.get("/health")
+async def provider_health() -> dict:
+    """Which model serves each step right now, and what is broken.
+
+    This exists because dispatch deliberately does NOT substitute providers.
+    ``run_llm`` fails loudly when the pinned provider cannot serve, so that
+    the user always knows which model produced their work — and the cost of
+    that choice is that they need somewhere to SEE a provider has died.
+    Without this view the first symptom of a dead CLI is a failed board run.
+
+    Two sections, because the two kinds of routing fail differently:
+
+    * ``features`` — the three the user pinned. A dead provider here means
+      that feature is down until they re-pin, and ``ok`` says so.
+    * ``internal`` — the steps nobody pins (rewrite, review, script, canvas
+      actions). These walk a chain, so what matters is which provider would
+      answer today, and whether anything in the chain can.
+    """
+    from flowboard.services.llm import registry as _registry
+
+    provider_state: dict[str, dict] = {}
+    for provider in _registry.list_providers():
+        try:
+            available = await provider.is_available()
+        except Exception:
+            logger.warning("llm: availability probe failed for %s",
+                           provider.name, exc_info=True)
+            available = False
+        auth = await _auth_mode_of(provider)
+        provider_state[provider.name] = {
+            "name": provider.name,
+            "available": available,
+            "authMode": auth,
+            "mode": getattr(provider, "mode", None) or "cli",
+            "capabilities": {
+                "text": True,
+                "vision": bool(provider.supports_vision),
+                # Audio is the one capability with a single supplier, which
+                # is exactly why it is worth naming: subtitles and karaoke
+                # timing have no second option on this stack.
+                "audio": bool(getattr(provider, "supports_audio", False)),
+            },
+        }
+
+    def _usable(state: Optional[dict]) -> bool:
+        """Installed AND signed in.
+
+        `is_available()` probes the binary with `--version`, which answers
+        for a CLI nobody has logged into — and this panel exists precisely
+        so a dead login is visible before a board run finds it. Reporting
+        `ok: true` there was the panel saying the opposite of its purpose.
+        """
+        if not state or not state["available"]:
+            return False
+        return state["authMode"] != cli_auth.NONE
+
+    def _first_usable(names: list[str], *, needs_vision: bool = False) -> Optional[str]:
+        for name in names:
+            state = provider_state.get(name)
+            if _usable(state) and (
+                not needs_vision or state["capabilities"]["vision"]
+            ):
+                return name
+        return None
+
+    saved = secrets.read_active_providers()
+    features = []
+    for feature in _VALID_FEATURES:
+        pinned = saved.get(feature)
+        state = provider_state.get(pinned) if pinned else None
+        features.append({
+            "feature": feature,
+            "provider": pinned,
+            "ok": _usable(state),
+            "reason": (
+                "not pinned" if not pinned
+                else "unknown provider" if state is None
+                else "provider unavailable" if not state["available"]
+                else "not signed in" if state["authMode"] == cli_auth.NONE
+                else None
+            ),
+        })
+
+    internal = []
+    for feature in sorted(_registry.DEFAULT_CHAINS):
+        chain = _registry.chain_for(feature)
+        served_by = _first_usable(chain)
+        internal.append({
+            "feature": feature,
+            "chain": chain,
+            "servedBy": served_by,
+            "ok": served_by is not None,
+        })
+
+    # Audio has no chain and no pin: `transcribe` reaches for Gemini
+    # directly. Reporting it here keeps "why did subtitles stop working"
+    # a one-glance question.
+    audio_providers = [
+        n for n, s in provider_state.items()
+        if s["capabilities"]["audio"] and s["available"]
+    ]
+    # Image generation sits outside the registry entirely — it produces
+    # pixels, not text, so it is not a `Feature` and has no pinned provider.
+    # Reported here anyway because this is the page someone opens to ask
+    # "what can the app do right now", and because both of its paths ship
+    # off: a node set to the OpenAI engine while both switches are off fails
+    # at run time, and this is where that becomes visible before the run.
+    from flowboard.services import openai_images
+
+    image_sources = openai_images.sources()
+    return {
+        "providers": list(provider_state.values()),
+        "features": features,
+        "internal": internal,
+        "audio": {"providers": audio_providers, "ok": bool(audio_providers)},
+        "images": {
+            "sources": image_sources,
+            "ok": bool(image_sources),
+            "model": openai_images.model_name(),
+            "quality": openai_images.quality(),
+        },
+    }
 
 
 # ── PUT /api/llm/providers/{name} ─────────────────────────────────────
@@ -112,13 +289,17 @@ async def list_providers() -> list[dict]:
 async def set_provider_key(name: str, body: _ApiKeyBody) -> dict:
     """Save (or clear, when `apiKey: null`) a provider's API key.
 
-    Only OpenAI's API mode accepts keys (its CLI path doesn't need one).
-    Setting a key on a CLI-only provider is a 400 — the UI shouldn't
-    reach this endpoint for them in the first place, but defend in depth.
+    OpenAI and Gemini both have an API mode alongside their CLI. Claude is
+    CLI-only here, so a key for it is a 400 — the UI shouldn't reach this
+    endpoint for it in the first place, but defend in depth.
+
+    Gemini used to be refused too, which was a mistake worth naming: it left
+    a user who could not finish the CLI's browser login with no way in at
+    all, while working keys sat unused on disk.
     """
     if name not in _VALID_PROVIDER_NAMES:
         raise HTTPException(status_code=404, detail=f"unknown provider {name!r}")
-    if name != "openai":
+    if name not in _API_KEY_PROVIDERS:
         raise HTTPException(
             status_code=400,
             detail=f"{name} doesn't accept API keys; uses CLI auth instead",
@@ -169,7 +350,7 @@ async def test_provider(name: str) -> dict:
         await provider.run(".", timeout=test_timeout)
     except LLMError as exc:
         return {"ok": False, "error": str(exc)[:200]}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Wrapped so the Test endpoint never 500s — UI can render the
         # error inline regardless of which exception type leaked through.
         logger.exception("llm: test endpoint hit unexpected error for %s", name)

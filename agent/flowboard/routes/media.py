@@ -79,3 +79,60 @@ def debug_assets():
                 for r in rows
             ],
         }
+
+
+@api_router.post("/open-output-folder")
+def open_output_folder() -> dict:
+    """Open the folder finished media is written to, in the OS file manager.
+
+    A local-only convenience, and the reason it is a POST rather than a GET:
+    it has a side effect on the machine, and a GET that launches a process is
+    something a stray prefetch can trigger.
+
+    The path is NOT taken from the request. It is derived from settings by
+    the same function the exporter uses, so this cannot be turned into
+    "open any folder on this box" by a crafted body — and it opens the folder
+    the files are actually in rather than one that merely looks right.
+    """
+    import os
+    import subprocess
+    import sys
+
+    from flowboard.services import media as media_service
+
+    target = media_service.output_dir()
+    if target is None:
+        raise HTTPException(
+            400,
+            "Chưa đặt thư mục lưu media. Mở Cài đặt → Lưu trữ để chọn.",
+        )
+    if not target.exists():
+        # Created rather than refused: the folder appears on first export, so
+        # before the first run "not there yet" is the normal state, and an
+        # error would read as a misconfiguration.
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(400, f"Không tạo được thư mục: {exc}") from None
+    elif not target.is_dir():
+        # `VIDEO_OUTPUT_DIR` naming a FILE is a misconfiguration, not an
+        # attack — but on Windows `os.startfile` means "open with the default
+        # handler", and for a `.bat` or an `.exe` that is run it. The setting
+        # arrives through the settings API and through imported configs, so it
+        # is not worth trusting to be a directory.
+        raise HTTPException(
+            400,
+            f"Đường dẫn lưu media không phải thư mục: {target}. "
+            "Mở Cài đặt → Lưu trữ để chọn lại.",
+        )
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+    except OSError as exc:
+        raise HTTPException(500, f"Không mở được thư mục: {exc}") from None
+    return {"path": str(target)}

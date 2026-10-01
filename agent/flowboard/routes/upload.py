@@ -15,7 +15,6 @@ Design choices:
 """
 from __future__ import annotations
 
-import base64
 import ipaddress
 import logging
 import socket
@@ -25,132 +24,25 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlmodel import select
 
-from flowboard.db import get_session
-from flowboard.db.models import Asset
-from flowboard.services import media as media_service
-from flowboard.services.flow_sdk import get_flow_sdk, is_valid_project_id
+from flowboard.services import image_ingest
+from flowboard.services.flow_sdk import is_valid_project_id
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
-ALLOWED_UPLOAD_MIMES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "image/gif",
-}
-_EXT_BY_MIME = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-}
 
-
-def _sniff_image_mime(raw: bytes) -> Optional[str]:
-    """Detect mime from magic bytes — used when the remote server doesn't send
-    a usable Content-Type or when we want to reject a lying Content-Type."""
-    if len(raw) < 12:
-        return None
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        return "image/webp"
-    if raw[:6] in (b"GIF87a", b"GIF89a"):
-        return "image/gif"
-    return None
-
-
-def _classify_aspect(width: int, height: int) -> str:
-    """Classify a pixel size into Flow's IMAGE_ASPECT_RATIO_* enum so the
-    frontend can default a downstream gen-dialog to match the upstream
-    asset's aspect (matches what `dispatchGeneration` later persists for
-    AI-generated nodes)."""
-    if width <= 0 or height <= 0:
-        return "IMAGE_ASPECT_RATIO_LANDSCAPE"
-    ratio = width / height
-    # 10% tolerance band around 1:1 → square. flowkit / Veo's enums only
-    # have square / portrait / landscape — anything ratio-close maps to
-    # the nearest bucket.
-    if 0.91 <= ratio <= 1.1:
-        return "IMAGE_ASPECT_RATIO_SQUARE"
-    if ratio > 1.1:
-        return "IMAGE_ASPECT_RATIO_LANDSCAPE"
-    return "IMAGE_ASPECT_RATIO_PORTRAIT"
-
-
-def _sniff_image_dimensions(raw: bytes) -> Optional[tuple[int, int]]:
-    """Extract (width, height) from PNG / JPEG / WebP / GIF magic-block
-    headers without spinning up Pillow — same defence-in-depth philosophy
-    as ``_sniff_image_mime``. Returns None when format is unknown or the
-    header is truncated."""
-    if len(raw) < 24:
-        return None
-    # PNG: IHDR after the 8-byte sig holds width, height as big-endian u32
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        try:
-            w = int.from_bytes(raw[16:20], "big")
-            h = int.from_bytes(raw[20:24], "big")
-            return w, h
-        except Exception:  # noqa: BLE001
-            return None
-    # GIF: 6-byte sig + 2 bytes width LE + 2 bytes height LE
-    if raw[:6] in (b"GIF87a", b"GIF89a"):
-        try:
-            w = int.from_bytes(raw[6:8], "little")
-            h = int.from_bytes(raw[8:10], "little")
-            return w, h
-        except Exception:  # noqa: BLE001
-            return None
-    # WebP (VP8/VP8L/VP8X) — only handle the simple lossy VP8 case fully;
-    # we still extract via the VP8X chunk for the extended format.
-    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        chunk = raw[12:16]
-        if chunk == b"VP8 " and len(raw) >= 30:
-            w = int.from_bytes(raw[26:28], "little") & 0x3FFF
-            h = int.from_bytes(raw[28:30], "little") & 0x3FFF
-            return w, h
-        if chunk == b"VP8L" and len(raw) >= 25:
-            b = raw[21:25]
-            w = ((b[1] & 0x3F) << 8 | b[0]) + 1
-            h = ((b[3] & 0x0F) << 10 | b[2] << 2 | (b[1] & 0xC0) >> 6) + 1
-            return w, h
-        if chunk == b"VP8X" and len(raw) >= 30:
-            w = (int.from_bytes(raw[24:27], "little") & 0xFFFFFF) + 1
-            h = (int.from_bytes(raw[27:30], "little") & 0xFFFFFF) + 1
-            return w, h
-        return None
-    # JPEG: scan for SOF0/SOF1/SOF2 marker (FFC0..FFC3 etc.)
-    if raw.startswith(b"\xff\xd8\xff"):
-        i = 2
-        n = len(raw)
-        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
-        try:
-            while i < n - 9:
-                if raw[i] != 0xFF:
-                    return None
-                marker = raw[i + 1]
-                # Standalone markers / restart markers — skip without length
-                if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-                    i += 2
-                    continue
-                # Segment with length
-                seg_len = int.from_bytes(raw[i + 2 : i + 4], "big")
-                if marker in sof_markers:
-                    h = int.from_bytes(raw[i + 5 : i + 7], "big")
-                    w = int.from_bytes(raw[i + 7 : i + 9], "big")
-                    return w, h
-                i += 2 + seg_len
-            return None
-        except Exception:  # noqa: BLE001
-            return None
-    return None
+# Owned by `services.image_ingest` now that the browser is not the only
+# source of image bytes. Re-exported under the old names because they are
+# part of this module's surface and callers should not have to care where
+# the implementation moved to.
+ALLOWED_UPLOAD_MIMES = image_ingest.ALLOWED_MIMES
+_EXT_BY_MIME = image_ingest.EXT_BY_MIME
+_sniff_image_mime = image_ingest.sniff_mime
+_classify_aspect = image_ingest.classify_aspect
+_sniff_image_dimensions = image_ingest.sniff_dimensions
 
 
 def _is_public_host(host: str) -> bool:
@@ -181,59 +73,23 @@ async def _ingest_image_bytes(
     file_name: str,
     node_id: Optional[int],
 ) -> dict:
-    """Push bytes to Flow's uploadImage, cache locally, upsert Asset row."""
-    image_b64 = base64.b64encode(raw).decode("ascii")
-    resp = await get_flow_sdk().upload_image(
-        image_base64=image_b64,
-        mime_type=mime,
-        project_id=project_id,
-        file_name=file_name,
-    )
-    if resp.get("error"):
-        raise HTTPException(
-            status_code=502,
-            detail={"message": resp["error"], "raw": resp.get("raw")},
-        )
-    media_id = resp.get("media_id")
-    if not isinstance(media_id, str) or not media_service.is_valid_media_id(media_id):
-        raise HTTPException(
-            status_code=502,
-            detail={"message": "invalid media_id from Flow", "raw": resp.get("raw")},
-        )
-    ext = _EXT_BY_MIME.get(mime, ".bin")
-    cache_path = media_service.MEDIA_CACHE_DIR / f"{media_id}{ext}"
+    """HTTP adapter over `image_ingest.ingest_bytes`.
+
+    The ingest itself is transport-neutral so the worker can call it too;
+    this only translates its failure into the response shape the frontend
+    has always received.
+    """
     try:
-        cache_path.write_bytes(raw)
-    except OSError as exc:
-        logger.error("failed to write upload cache %s: %s", cache_path, exc)
-        raise HTTPException(status_code=500, detail="failed to cache upload")
-    with get_session() as s:
-        row = s.exec(
-            select(Asset).where(Asset.uuid_media_id == media_id)
-        ).first()
-        if row is None:
-            row = Asset(
-                uuid_media_id=media_id,
-                kind="image",
-                local_path=str(cache_path),
-                mime=mime,
-                node_id=node_id,
-            )
-        else:
-            row.local_path = str(cache_path)
-            row.mime = mime
-            if node_id is not None and row.node_id is None:
-                row.node_id = node_id
-        s.add(row)
-        s.commit()
-    out: dict = {"media_id": media_id, "mime": mime, "size": len(raw)}
-    dims = _sniff_image_dimensions(raw)
-    if dims is not None:
-        w, h = dims
-        out["width"] = w
-        out["height"] = h
-        out["aspect_ratio"] = _classify_aspect(w, h)
-    return out
+        return await image_ingest.ingest_bytes(
+            raw, mime, project_id, file_name, node_id
+        )
+    except image_ingest.IngestError as exc:
+        detail: object = (
+            {"message": exc.message, "raw": exc.raw}
+            if exc.raw is not None
+            else exc.message
+        )
+        raise HTTPException(status_code=exc.status, detail=detail) from exc
 
 
 @router.post("/upload")
@@ -298,7 +154,7 @@ async def upload_image_from_url(body: UrlUploadBody):
         ) as client:
             resp = await client.get(body.url)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"fetch failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"fetch failed: {exc}") from exc
 
     if resp.status_code != 200:
         raise HTTPException(

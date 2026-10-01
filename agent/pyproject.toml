@@ -11,9 +11,34 @@ dependencies = [
     "websockets>=12.0",
     "python-multipart>=0.0.9",
     "httpx>=0.27",
+    # Video Clone: fetch a clip from a URL so it can be cut, subtitled or
+    # upscaled locally. Sites change their players constantly, so expect this
+    # one to need updating far more often than the rest.
+    "yt-dlp>=2025.1.1",
+    # Excel batch: import a sheet of prompts/settings, export results back.
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
+# Offline speech-to-text with real per-word alignment. Kept out of the base
+# install on purpose: it pulls CTranslate2 and downloads a few hundred
+# megabytes of model on first use, and the feature it powers — karaoke
+# timings that land on the word being spoken — is opt-in behind
+# LOCAL_STT_ENABLED. Without it the SRT path still works through Gemini or
+# whisper-1, and karaoke falls back to its length-weighted split.
+stt-local = [
+    "faster-whisper>=1.0",
+]
+# MI-GAN watermark inpainting on the CPU. Optional for the same reason: the
+# app deliberately carries no image dependencies — `routes/upload` sniffs PNG
+# and JPEG headers by hand rather than pull in Pillow — and this is the third
+# chance at a job the bundled GPU tool usually does in seconds. It only runs
+# when that tool declines AND the workflow says where the mark is.
+# The model itself ships with the packaged tool, not here.
+inpaint = [
+    "onnxruntime>=1.17",
+    "numpy>=1.24",
+]
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",
@@ -30,3 +55,44 @@ packages = ["flowboard"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+# What ruff checks here, and why it is a selection rather than the default.
+#
+# Run unselected, ruff reports ~800 findings on this tree and 536 of them are
+# `UP045` — "write `X | None`, not `Optional[X]`". That is a dialect preference,
+# not a defect; the code is `Optional[...]` throughout and consistent. Accepting
+# that rewrite would produce a diff of hundreds of annotation changes in which a
+# real finding could hide.
+#
+# The families below catch mistakes instead: undefined and unused names,
+# likely-bug patterns, the async/subprocess traps that matter in a worker that
+# shells out to ffmpeg, and unsorted imports.
+[tool.ruff.lint]
+select = ["F", "E4", "E7", "E9", "B", "ASYNC", "PLE", "PLW", "RUF100", "S102", "S307"]
+ignore = [
+    # The codebase catches broad exceptions deliberately and says why at each
+    # site: one dead media source must not end a chain, one bad segment must
+    # not lose a narration. A blanket ban here would mean a `noqa` on every one.
+    "B008",
+    # `subprocess.run` without `check=`: every call site inspects `returncode`
+    # itself, because the error text ffmpeg prints is the useful part and
+    # `check=True` throws it away.
+    "PLW1510",
+    # A `Path.is_file()` inside an async function is a stat call — microseconds,
+    # not a stall. The rule is right about the shape and wrong about the cost
+    # here; the calls that genuinely block (subprocess, ffmpeg, the models) go
+    # through a thread and are caught by ASYNC221 instead.
+    "ASYNC240",
+    # Module-level singletons (the worker, the SDK, the flow client) are set
+    # through `global` by design, and each site says so. Restructuring them
+    # into a registry is an architecture change, not a lint fix.
+    "PLW0603",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import fixtures for their side effects and assert on private helpers.
+# The two style rules below are about test-local shape, not about defects:
+# `E702` is one parametrised file that packs setup onto one line per case, and
+# `PLW0108` is the `lambda *a: ...` stub that monkeypatch fixtures are written
+# with. Enforcing either would churn test files without making a test truer.
+"tests/*" = ["F401", "B011", "E702", "PLW0108", "B007", "PLW2901"]

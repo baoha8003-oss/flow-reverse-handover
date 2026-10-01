@@ -2,10 +2,10 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from sqlmodel import select
 
 from flowboard.db import get_session
-from flowboard.db.models import Asset, Board, Edge, Node, Request
+from flowboard.db.models import Board, Node
+from flowboard.services.node_ops import delete_node_cascade, merge_node_data
 from flowboard.short_id import generate_unique_short_id
 
 router = APIRouter(prefix="/api/nodes", tags=["nodes"])
@@ -21,6 +21,23 @@ NodeType = Literal[
     # `image` for storage / dispatch — see frontend/src/lib/storyboardPrompt.ts
     # for the template that drives gen_image.
     "Storyboard",
+    # Motion transfer. A GENERATION node, not a post-production one: it
+    # dispatches the same reference-to-video request the Component mode uses.
+    # The driving clip it is named after never leaves this machine — see
+    # Post-production. Each runs local ffmpeg through the one `postprod`
+    # request type — no Flow call, no credits. They exist as separate node
+    # types rather than one configurable box because the graph should say
+    # what a step does without opening it.
+    "analyze_video",
+    "merge_video",
+    "edit_video",
+    "extract_last_frame",
+    "add_bgm",
+    "create_voice",
+    "align_video_voice",
+    "sync_image_voice",
+    "remove_watermark",
+    "review_video",
 ]
 NodeStatus = Literal["idle", "queued", "running", "done", "error"]
 
@@ -106,13 +123,7 @@ def update_node(node_id: int, body: NodeUpdate):
         patch = body.model_dump(exclude_unset=True)
         for k, v in patch.items():
             if k == "data" and isinstance(v, dict):
-                merged = dict(node.data or {})
-                for dk, dv in v.items():
-                    if dv is None:
-                        merged.pop(dk, None)
-                    else:
-                        merged[dk] = dv
-                node.data = merged
+                node.data = merge_node_data(node.data, v)
             else:
                 setattr(node, k, v)
         s.add(node)
@@ -143,30 +154,6 @@ def delete_node(node_id: int):
         node = s.get(Node, node_id)
         if not node:
             raise HTTPException(404, "node not found")
-        # Detach historical children FIRST so the FK constraint is satisfied.
-        orphan_requests = s.exec(
-            select(Request).where(Request.node_id == node_id)
-        ).all()
-        for r in orphan_requests:
-            r.node_id = None
-            s.add(r)
-        orphan_assets = s.exec(
-            select(Asset).where(Asset.node_id == node_id)
-        ).all()
-        for a in orphan_assets:
-            a.node_id = None
-            s.add(a)
-        # Edges go with the node.
-        edges = s.exec(
-            select(Edge).where((Edge.source_id == node_id) | (Edge.target_id == node_id))
-        ).all()
-        for e in edges:
-            s.delete(e)
-        s.delete(node)
+        result = delete_node_cascade(s, node)
         s.commit()
-        return {
-            "ok": True,
-            "deleted_edges": [e.id for e in edges],
-            "detached_requests": len(orphan_requests),
-            "detached_assets": len(orphan_assets),
-        }
+        return result

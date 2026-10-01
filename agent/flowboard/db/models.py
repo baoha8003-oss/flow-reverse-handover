@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel, Column, JSON
@@ -47,6 +47,16 @@ class Edge(SQLModel, table=True):
     # downstream A, variant 3 for downstream B" with two clicks; the
     # edge UI surfaces the pinned index so the binding stays visible.
     source_variant_idx: Optional[int] = None
+    # Which socket on each end the wire is plugged into. A node can have more
+    # than one input that means different things — a start frame is not an end
+    # frame, image_1 is not image_2 — and without a port name the executor can
+    # only tell them apart by arrival order, which is the positional pairing
+    # this build removed everywhere else.
+    #
+    # None means "the node's default socket", which is what every edge drawn
+    # by hand in the canvas still is.
+    source_port: Optional[str] = None
+    target_port: Optional[str] = None
 
 
 class Request(SQLModel, table=True):
@@ -59,6 +69,30 @@ class Request(SQLModel, table=True):
     error: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     finished_at: Optional[datetime] = None
+
+    # Batch + retry bookkeeping (P1 schema; wired by the worker in P2).
+    # A request belongs to at most one of node_id / scene_id — canvas mode
+    # and tab mode share the same queue.
+    # No DB-level FK: SQLite cannot add one through ALTER, so a migrated
+    # database would silently disagree with a fresh one (fresh raises on a
+    # BatchJob delete, migrated orphans the children). The route layer
+    # validates instead — same rule as scene_id below.
+    batch_id: Optional[int] = Field(default=None, index=True)
+    batch_index: Optional[int] = None  # position within its batch (stable order)
+    attempt: int = 0
+    max_attempts: int = 3
+    # Retries that deliberately don't burn `attempt` still need a ceiling,
+    # or an expired token / unsolved captcha re-dispatches for the rest of
+    # the session against the one real account this tool depends on.
+    free_retries: int = 0
+    captcha_retries: int = 0
+    # Backoff gate the sweeper reads: don't re-dispatch before this time.
+    next_attempt_at: Optional[datetime] = Field(default=None, index=True)
+    # In-flight progress, written during processing: {phase, done, total, pct, note}.
+    progress: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    # Library write-back target (P4). FK not enforced on SQLite ALTER-added
+    # columns — the route layer validates.
+    scene_id: Optional[int] = Field(default=None, index=True)
 
 
 class Asset(SQLModel, table=True):
@@ -161,6 +195,62 @@ class PipelineRun(SQLModel, table=True):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     error: Optional[str] = None
+
+
+class CanvasAction(SQLModel, table=True):
+    """One applied canvas-agent edit, with enough to undo its structure.
+
+    Stored rather than derived because undo has to know what the board looked
+    like BEFORE — a node's previous `data`, an edge that existed. Recomputing
+    that from the current board is guessing.
+
+    `provider` records which AI actually answered. The chain can fall through
+    to a different provider than the one the panel showed, and "why does this
+    plan look nothing like last time" has no answer without it.
+
+    `undone_at` rather than deleting the row: a spend record and an audit trail
+    are the two things this table is for, and a deleted row has neither.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    board_id: int = Field(foreign_key="board.id", index=True)
+    #: create_node | configure_node | connect_nodes | disconnect_nodes | ...
+    kind: str
+    summary: str = ""
+    #: What was asked for, as applied. Kept for the diff card and the log.
+    payload: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    #: Enough previous state to reverse the structure. Shape depends on `kind`.
+    inverse: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    provider: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    undone_at: Optional[datetime] = None
+
+
+class BatchJob(SQLModel, table=True):
+    """One user action that fans out to N Request rows (e.g. 20 prompts,
+    one video each). Parent status is recomputed from its children's
+    statuses — see the worker. Kept separate from Request so a batch has
+    its own identity, label, and lifecycle."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    kind: str  # gen_video | gen_image | gen_video_text | ...
+    label: str = ""
+    params: dict = Field(default_factory=dict, sa_column=Column(JSON))
+    status: str = "queued"  # queued | running | done | partial | failed | canceled
+    total: int = 0
+    project_id: Optional[int] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    finished_at: Optional[datetime] = None
+
+
+class AppSetting(SQLModel, table=True):
+    """Key→value overrides layered over the shipped config.json defaults.
+
+    Value is any JSON scalar/structure (a string ratio, an int count, a
+    bool). Only whitelisted keys are ever written here — credential and
+    account keys are refused at the route layer, never persisted."""
+    key: str = Field(primary_key=True)
+    value: Any = Field(default=None, sa_column=Column(JSON))
+    updated_at: datetime = Field(default_factory=_utcnow)
 
 
 class BoardFlowProject(SQLModel, table=True):

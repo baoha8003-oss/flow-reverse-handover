@@ -10,6 +10,18 @@ router = APIRouter(prefix="/api/edges", tags=["edges"])
 
 EdgeKind = Literal["ref", "hint"]
 
+#: A port name is an identifier the executor matches on, not free text.
+#: Bounded and normalised here so a blank string cannot become a socket that
+#: no node has and every lookup then misses.
+_MAX_PORT_CHARS = 60
+
+
+def _port(value: Optional[str]) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned[:_MAX_PORT_CHARS] if cleaned else None
+
 
 class EdgeCreate(BaseModel):
     board_id: int
@@ -20,6 +32,15 @@ class EdgeCreate(BaseModel):
     # Frontend passes when the user picks a variant before drawing the
     # edge (or when right-click → pin variant on an existing edge).
     source_variant_idx: Optional[int] = None
+    # Which socket each end plugs into. A node can have several inputs that
+    # mean different things — a start frame is not an end frame, image_1 is
+    # not image_2 — and the executor reads the port to tell them apart.
+    #
+    # These were missing, so a wire drawn on the canvas arrived with no
+    # socket while an imported one kept its own: the same two nodes wired the
+    # same way behaved differently depending on where the board came from.
+    source_port: Optional[str] = None
+    target_port: Optional[str] = None
 
 
 class EdgePatch(BaseModel):
@@ -45,6 +66,8 @@ def create_edge(body: EdgeCreate):
             target_id=body.target_id,
             kind=body.kind,
             source_variant_idx=body.source_variant_idx,
+            source_port=_port(body.source_port),
+            target_port=_port(body.target_port),
         )
         s.add(edge)
         s.commit()
