@@ -4,7 +4,7 @@
 nhận đọc và dựng lại. Nó **không phải** một sản phẩm hoàn chỉnh, và một số năng lực trong đây **chưa
 bao giờ được chạy thật**.
 
-Đọc `docs/spec.md` trước mọi thứ khác.
+**Bắt đầu ở đây: [`docs/brief-automation-workflow-cho-dev-tu.md`](docs/brief-automation-workflow-cho-dev-tu.md)** — brief viết cho người tiếp nhận: bài toán thật từ Google Sheet của khách, vì sao không gọi API trực tiếp được, chọn model theo chi phí, luật tiền, phạm vi v1 và cách nghiệm thu. Cuối brief có bảng thứ tự đọc các tài liệu còn lại.
 
 ---
 
