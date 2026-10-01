@@ -35,6 +35,9 @@ interface GenerationState {
       // we generate one video per variant. Backend sends N items in the
       // batchAsyncGenerate body so all are dispatched together.
       sourceMediaIds?: string[];
+      // First→last frame interpolation: the clip starts on the source image
+      // and lands on this one. Only valid with a single source.
+      endMediaId?: string;
       variantCount?: number;
       // Per-variant prompts. When provided, each variant uses its own
       // prompt — required for batch auto-prompt to keep poses distinct
@@ -151,30 +154,21 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
     kind?: "image" | "video";
     sourceMediaId?: string;
     sourceMediaIds?: string[];
+    endMediaId?: string;
     variantCount?: number;
     prompts?: string[];
   }) {
     const projectId = await get().ensureProjectId();
     if (projectId === null) return;
 
-    // Pre-flight: refuse to dispatch if the paygate tier is unknown.
-    // The backend would reject with `paygate_tier_unknown` anyway (since
-    // Phase 1 stopped silently defaulting to Pro), but bailing here gives
-    // the user a clearer hint without spending a captcha round-trip and
-    // without leaving a `failed` request row in the DB. The
-    // AccountPanel's "Tier unknown — Open Flow" banner is the recovery
-    // path.
+    // No tier pre-flight any more. It used to refuse here, mirroring a backend
+    // that rejected `paygate_tier_unknown` — right while the Flow payload
+    // carried `userPaygateTier` and a wrong value served an Ultra account at
+    // the Pro checkpoint. Google's September 2026 migration removed that field
+    // from the wire, and the tier can no longer be detected at all: it is a
+    // label the user picks in Settings. Keeping the gate would strand every
+    // generation behind a dropdown nothing can fill on its own.
     const knownTier = opts.paygateTier ?? get().paygateTier;
-    if (!knownTier) {
-      set({
-        error: "Open Flow once so the extension can detect your plan, then retry. (See the Tier-unknown banner in the bottom-left.)",
-      });
-      useBoardStore.getState().updateNodeData(rfId, {
-        status: "error",
-        error: "paygate_tier_unknown",
-      });
-      return;
-    }
 
     // Cancel existing poll for this node if any
     const existingEntry = get().active[rfId];
@@ -236,7 +230,7 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
               aspect_ratio:
                 opts.aspectRatio ?? "VIDEO_ASPECT_RATIO_PORTRAIT",
               paygate_tier:
-                opts.paygateTier ?? get().paygateTier ?? "PAYGATE_TIER_ONE",
+                knownTier ?? undefined,
             },
           });
         } else {
@@ -258,7 +252,7 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             // Tier precedence: explicit caller arg > auto-detected from
             // Flow > TIER_ONE fallback. The dialog no longer asks the user.
             paygate_tier:
-              opts.paygateTier ?? get().paygateTier ?? "PAYGATE_TIER_ONE",
+              knownTier ?? undefined,
             // Backend resolves [tier][quality][aspect] → Flow model key.
             video_quality: settings.videoQuality,
           };
@@ -266,6 +260,11 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             videoParams.start_media_ids = opts.sourceMediaIds;
           } else {
             videoParams.start_media_id = opts.sourceMediaId;
+          }
+          // One destination frame cannot serve a batch of different sources,
+          // so the end frame only applies to the single-source path.
+          if (opts.endMediaId && !hasMulti) {
+            videoParams.end_media_id = opts.endMediaId;
           }
           reqDto = await createRequest({
             type: "gen_video",
@@ -275,17 +274,45 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
         }
       } else {
         const refMediaIds = collectUpstreamRefMediaIds(rfId);
+        // Which service draws this node. The board run has honoured the
+        // per-node engine since it existed; this button did not, so a node
+        // switched to OpenAI still spent Flow credits when generated on its
+        // own — the silent engine substitution the executor refuses to make.
+        const node = useBoardStore.getState().nodes.find((n) => n.id === rfId);
+        const useOpenai = node?.data.imageEngine === "openai";
         const params: Record<string, unknown> = {
           prompt: opts.prompt,
           project_id: projectId,
           aspect_ratio: opts.aspectRatio ?? "IMAGE_ASPECT_RATIO_LANDSCAPE",
           paygate_tier:
-            opts.paygateTier ?? get().paygateTier ?? "PAYGATE_TIER_ONE",
+            knownTier ?? undefined,
           variant_count: variantCount,
+        };
+        if (useOpenai) {
+          // The generations endpoint draws from text alone, so honouring the
+          // engine while dropping the reference photos would buy a confident
+          // picture of the wrong person. Refuse instead — with the same CODE the
+          // executor stamps, not a sentence of its own.
+          //
+          // This wrote Vietnamese prose into `node.data.error`, where the whole
+          // convention is a machine code the card translates through
+          // `errorLabels`. Prose there is unmatchable by a log, a test or a
+          // re-run, and it guaranteed divergence the next time either wording was
+          // touched — the two already read differently while the comment here
+          // claimed they were "the same words the executor uses".
+          if (refMediaIds.length > 0) {
+            useBoardStore.getState().updateNodeData(rfId, {
+              status: "error",
+              error: "openai_image_refs_unsupported",
+            });
+            set({ error: "OpenAI không nhận ảnh tham chiếu" });
+            return;
+          }
+        } else {
           // User's image model preference from the Settings panel.
           // Backend resolves the nickname → real Flow model identifier.
-          image_model: useSettingsStore.getState().imageModel,
-        };
+          params.image_model = useSettingsStore.getState().imageModel;
+        }
         if (refMediaIds.length > 0) {
           params.ref_media_ids = refMediaIds;
         }
@@ -296,7 +323,7 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
           params.prompts = opts.prompts;
         }
         reqDto = await createRequest({
-          type: "gen_image",
+          type: useOpenai ? "gen_image_openai" : "gen_image",
           node_id: isNaN(nodeDbId) ? undefined : nodeDbId,
           params,
         });
@@ -547,7 +574,8 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
           source_media_id: sourceMediaId,
           ref_media_ids: opts.refMediaIds ?? [],
           aspect_ratio: opts.aspectRatio ?? "IMAGE_ASPECT_RATIO_LANDSCAPE",
-          paygate_tier: get().paygateTier ?? "PAYGATE_TIER_ONE",
+          // Label only — omitted when unset, never guessed. See dispatchGeneration.
+          paygate_tier: get().paygateTier ?? undefined,
           image_model: useSettingsStore.getState().imageModel,
         },
       });

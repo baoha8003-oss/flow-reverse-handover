@@ -1,58 +1,27 @@
-import { useEffect, useRef } from "react";
-import { ReactFlowProvider } from "@xyflow/react";
-import { Board } from "./canvas/Board";
-import { AddNodePalette } from "./canvas/AddNodePalette";
-import { StatusBar } from "./components/StatusBar";
-import { Toolbar } from "./components/Toolbar";
-// import { ChatSidebar } from "./components/ChatSidebar";
-import { ProjectSidebar } from "./components/ProjectSidebar";
-import { ReferencesPanel } from "./components/ReferencesPanel";
+import { AppShell } from "./shell/AppShell";
 import { Toaster } from "./components/Toaster";
 import { GenerationDialog } from "./components/GenerationDialog";
 import { ResultViewer } from "./components/ResultViewer";
-import { ForcedSetupGate } from "./components/ForcedSetupGate";
-import { useBoardStore } from "./store/board";
-import { useReferencesStore } from "./store/references";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 export function App() {
-  const loadInitialBoard = useBoardStore((s) => s.loadInitialBoard);
-  const loadReferences = useReferencesStore((s) => s.load);
-  const loading = useBoardStore((s) => s.loading);
-  const boardId = useBoardStore((s) => s.boardId);
-  const ran = useRef(false);
-
-  useEffect(() => {
-    if (ran.current) return;
-    ran.current = true;
-    loadInitialBoard();
-    // Fire-and-forget: panel renders the loading state inline and the
-    // app stays usable even if references fail to hydrate.
-    void loadReferences();
-  }, [loadInitialBoard, loadReferences]);
-
   return (
-    <div className="app">
-      <ProjectSidebar />
-      <ReactFlowProvider>
-        <div className="canvas-wrap">
-          <Toolbar />
-          {loading && boardId === null ? (
-            <div className="canvas-loading">Loading board…</div>
-          ) : (
-            <>
-              <Board />
-              <AddNodePalette />
-            </>
-          )}
-          <StatusBar />
-          <ReferencesPanel />
-        </div>
-      </ReactFlowProvider>
-      {/* <ChatSidebar /> */}
+    <ErrorBoundary>
+      <AppShell />
+      {/* Global overlays — persist across pill/tab switches. The dialog and
+          viewer serve the canvas (WORKFLOW pill); the tabs use store/jobs.
+
+          No forced AI-provider gate. It made sense when this app was only a
+          canvas, where every action ran through an LLM. The generation tabs
+          don't use one at all, so an undismissable dialog at boot locks the
+          user out of the whole tool over a dependency their task never
+          needs — and it did exactly that when the CLI it defaulted to
+          couldn't sign in. The LLM paths still fail loudly with a clear
+          message, and the canvas toolbar's "Setup AI" button is the way in
+          when someone actually wants those features. */}
       <Toaster />
       <GenerationDialog />
       <ResultViewer />
-      <ForcedSetupGate />
-    </div>
+    </ErrorBoundary>
   );
 }

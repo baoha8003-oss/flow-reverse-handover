@@ -508,17 +508,9 @@ button:disabled {
   margin-top: 1px;
   min-width: 0;
 }
-.account-panel__credits-inline {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
-}
-.account-panel__credits-value {
-  color: var(--accent);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
+/* The credit balance used to sit here. There is no credits RPC on the migrated
+ * Flow transport, so the chip cannot read a balance and no longer pretends to —
+ * see AccountPanel.tsx. */
 
 /* Disconnected state — meta column holds only the Scan button (or
  * recovery hint after a failed probe), so center it vertically and
@@ -581,6 +573,10 @@ button:disabled {
   max-width: 100%;
 }
 
+/* Second line of the chip: the bridge state, in place of the email address that
+ * is no longer knowable. Same type treatment — it is still the quiet line under
+ * the name. */
+.account-panel__state,
 .account-panel__email {
   font-size: 11px;
   color: var(--muted);
@@ -768,6 +764,13 @@ button:disabled {
   color: var(--accent);
   text-decoration: none;
   white-space: nowrap;
+  /* It was an <a> to Flow; now it opens Settings, so a button carries the
+     browser's default chrome unless it is reset here. */
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font-family: inherit;
 }
 .account-panel__tier-warning-cta:hover {
   text-decoration: underline;
@@ -1494,6 +1497,140 @@ button:disabled {
 .brief-hint--pending {
   font-style: italic;
   opacity: 0.7;
+}
+
+/* Board-level actions: retry what failed, stop everything, save the board
+   as a template, open the results folder, hide previews, hold the queue.
+   Grouped in one strip because they are all what you reach for when a run
+   went wrong — hunting for Stop while credits are being spent is the failure
+   this layout avoids. */
+.board-actions {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 62%;
+  justify-content: flex-end;
+}
+.board-actions__btn {
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.board-actions__btn:hover:not(:disabled) {
+  background: var(--elevated, var(--panel));
+}
+
+/* The shape picker sits with its own button: the select decides WHAT gets
+   built and the button builds it, so keeping them apart would make the pair
+   read as two unrelated controls. */
+.board-actions__shape {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.board-actions__shape select {
+  font-size: 11px;
+  padding: 4px 6px;
+  max-width: 190px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+.board-actions__btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.board-actions__btn.is-on {
+  border-color: var(--accent, var(--border));
+  background: var(--elevated, var(--panel));
+}
+.board-actions__btn--danger {
+  color: var(--danger, #c0392b);
+}
+.board-actions__queue {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+}
+.board-actions__count {
+  font-size: 11px;
+  color: var(--muted);
+}
+.board-actions__note {
+  font-size: 11px;
+  color: var(--muted);
+  max-width: 100%;
+}
+.board-actions__error {
+  font-size: 11px;
+  color: var(--danger, #c0392b);
+  max-width: 100%;
+}
+
+/* Collapsed node library: the plus stays, the seventeen chips do not. The
+   affordance has to remain visible — removing the only way to add a node is
+   not a "collapse". */
+.add-node-palette--collapsed {
+  width: auto;
+}
+.add-node-plus {
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+/* A result that exists while previews are off. Not blank: blank is
+   indistinguishable from an empty node, which is the opposite of true. */
+.thumbnail-tile--hidden {
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+/* Which service draws an image node. A two-state chip rather than a select:
+   there are exactly two answers and the current one has to be readable at a
+   glance on a canvas full of cards. */
+.image-engine {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+}
+.image-engine__opt {
+  font-size: 9px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.image-engine__opt.is-active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--accent, var(--border));
+}
+.image-engine__warn {
+  font-size: 9px;
+  color: var(--warn, #d08700);
+  margin-left: 2px;
 }
 
 .character-drop__generate {
@@ -4450,6 +4587,69 @@ button:disabled {
   line-height: 1.4;
 }
 
+/* Provider health — what runs on what, and what is broken.
+   Sits above the provider cards because a user opens this dialog when
+   something has already gone wrong, and this is the row that names it. */
+.provider-health {
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  font-size: 11px;
+}
+.provider-health--loading,
+.provider-health--error { color: #9aa0aa; }
+.provider-health--error { color: #ffb4a8; }
+.provider-health__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.provider-health__title { font-weight: 600; color: #d8dbe2; }
+.provider-health__refresh {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  color: #9aa0aa;
+  cursor: pointer;
+  font-size: 10px;
+  padding: 2px 8px;
+}
+.provider-health__refresh:hover { color: #d8dbe2; border-color: rgba(255,255,255,0.3); }
+.provider-health__ok { color: #7fd18b; margin-bottom: 6px; }
+.provider-health__list { list-style: none; margin: 0; padding: 0; }
+.provider-health__list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.provider-health__list li:last-child { border-bottom: none; }
+.provider-health__feature { color: #9aa0aa; }
+.provider-health__value { color: #d8dbe2; text-align: right; }
+.provider-health__list li.is-down .provider-health__value { color: #ffb4a8; }
+.provider-health__providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.provider-health__providers span {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(127, 209, 139, 0.12);
+  color: #7fd18b;
+  font-size: 10px;
+}
+.provider-health__providers span.is-down {
+  background: rgba(255, 180, 168, 0.12);
+  color: #ffb4a8;
+}
+
 /* Setup help modal */
 .setup-modal-backdrop {
   position: fixed;
@@ -5702,3 +5902,348 @@ button:disabled {
   animation: none;
 }
 
+
+/* ── Post-production node cards ─────────────────────────────────────────
+   These nodes have no image to preview: they carry a configuration. The
+   card shows the few settings that identify the step so the board reads
+   without opening every box. */
+.postprod-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+}
+
+.postprod-empty {
+  color: var(--ink-dim, #8a8a8a);
+  font-style: italic;
+}
+
+.postprod-out {
+  color: var(--ok, #4caf50);
+  font-weight: 600;
+}
+
+.postprod-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+}
+
+/* The one editable thing on a post-production card: where the CPU watermark
+   pass should paint if the detector declines. Small and inline, because it is
+   a fallback setting rather than the point of the node. */
+/* On the prompt node, not in a toolbar: the button acts on THIS node's
+   lines, and a global button would need the user to select the node first. */
+/* On the character card: which registered character this node is. Inline and
+   small, because the picture is still the point of the card. */
+.character-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.character-link select {
+  font-size: 9px;
+  padding: 1px 3px;
+  max-width: 132px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+.character-link button {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.character-link__warn {
+  flex-basis: 100%;
+  font-size: 9px;
+  color: var(--warn, #d08700);
+  margin: 2px 0 0;
+}
+
+/* Re-reading the failed narration segments. Same weight as the other card
+   controls: a secondary action, with the money sentence above the button because
+   the point of the control is that the finished segments are NOT re-bought. */
+.narration-reread {
+  margin-top: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.narration-reread__note,
+.narration-reread__msg {
+  font-size: 9px;
+  margin: 0;
+  color: var(--muted);
+}
+.narration-reread__rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 9px;
+  color: var(--muted);
+}
+.narration-reread button {
+  align-self: flex-start;
+  font-size: 9px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.narration-reread button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Upscale + extend, on a finished clip. Same visual weight as the character
+   row: these are secondary actions on a card, not the card's purpose. A
+   disabled button keeps its reason in `title`, so hovering answers "why not". */
+.clip-ops {
+  margin-top: 4px;
+}
+.clip-ops__row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.clip-ops__row button {
+  font-size: 9px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.clip-ops__row button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.clip-ops__lane {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.clip-ops__lane input {
+  margin: 0;
+}
+.clip-ops__out,
+.clip-ops__note {
+  font-size: 9px;
+  margin: 2px 0 0;
+  color: var(--muted);
+}
+
+.prompt-fanout {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 9px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+.prompt-fanout:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.postprod-pick {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  justify-content: space-between;
+}
+.postprod-pick > span {
+  color: var(--ink-dim, #8a8a8a);
+  white-space: nowrap;
+}
+.postprod-pick select {
+  font-size: 10px;
+  padding: 1px 3px;
+  max-width: 130px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.postprod-settings > div {
+  display: flex;
+  gap: 6px;
+  justify-content: space-between;
+}
+
+.postprod-settings dt {
+  color: var(--ink-dim, #8a8a8a);
+  white-space: nowrap;
+}
+
+.postprod-settings dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Run the whole board ────────────────────────────────────────────────
+   Bottom-right, opposite the add-node palette: the two are the canvas's
+   only global actions and putting them together would make a mis-click
+   between "add a node" and "spend credits" easy. */
+.run-board-btn {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 5;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl, 8px);
+  background: var(--accent, #6b4de6);
+  color: #fff;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.run-board-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.run-board-error {
+  position: absolute;
+  right: 16px;
+  bottom: 56px;
+  z-index: 5;
+  max-width: 320px;
+  border-radius: var(--radius-ctl, 8px);
+  background: var(--card, #1c1c22);
+  border: 1px solid var(--danger, #e5484d);
+  color: var(--danger, #e5484d);
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.run-cost-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.run-cost-dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card, #1c1c22);
+  color: var(--ink, #e8e8ea);
+  padding: 18px 20px;
+}
+
+.run-cost-cancel,
+.run-cost-confirm {
+  border-radius: var(--radius-ctl, 8px);
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.run-cost-cancel {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink, #e8e8ea);
+}
+
+.run-cost-confirm {
+  border: 1px solid transparent;
+  background: var(--accent, #6b4de6);
+  color: #fff;
+  font-weight: 600;
+}
+
+.run-cost-confirm:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* The rule that gates Apply, written where it can be read.
+   It used to live only in the button's native `title`, which truncates at
+   the window edge and needs a second of hover — long enough for someone to
+   decide the button is broken. */
+.selection-panel__requirement {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent, #6b4de6);
+  border-radius: 0 var(--radius-ctl, 8px) var(--radius-ctl, 8px) 0;
+  background: color-mix(in srgb, var(--accent, #6b4de6) 10%, transparent);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink, #e8e8ea);
+}
+
+.selection-panel__requirement code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.3);
+  font-size: 11px;
+}
+
+/* An action sitting inside a sentence — "…rồi bấm [Kiểm tra lại]." Styled
+   as a link rather than a button so the sentence still reads as prose. */
+.selection-panel__inline-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent, #8b6dff);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.selection-panel__inline-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Until the test passes, Test IS the next step — so it looks like one.
+   Apply stays visible but plainly secondary. */
+.feature-test-row__btn--primary {
+  background: var(--accent, #6b4de6);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}

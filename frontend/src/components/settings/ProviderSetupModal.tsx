@@ -150,26 +150,38 @@ function GeminiContent() {
   return (
     <div className="setup-modal__body">
       <p>
-        Flowboard uses your existing Gemini subscription via the official
-        CLI — no API key needed.
+        <strong>An API key is the recommended route.</strong> Google has
+        retired the Gemini CLI's login for individual accounts — it answers{" "}
+        <code>IneligibleTierError … migrate to Antigravity</code> even when the
+        binary is installed — so the CLI below only works on an eligible
+        (enterprise) account.
       </p>
       <ol className="setup-modal__steps">
         <li>
-          <span className="setup-modal__step-label">Install</span>
-          <CommandLine cmd="npm install -g @google/gemini-cli" />
+          <span className="setup-modal__step-label">Get a key</span>
+          <a
+            className="setup-modal__step-link"
+            href="https://aistudio.google.com/apikey"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            aistudio.google.com/apikey ↗
+          </a>
         </li>
         <li>
-          <span className="setup-modal__step-label">Authenticate</span>
-          <CommandLine cmd="gemini auth login" />
-        </li>
-        <li>
-          <span className="setup-modal__step-label">Verify</span>
-          <CommandLine cmd="gemini --version" />
+          <span className="setup-modal__step-label">Save it</span>
+          <span className="setup-modal__step-hint">
+            Paste it into the Gemini panel behind this dialog and click
+            Save key. Several keys can be listed in{" "}
+            <code>data_general/gemini_api_key.txt</code> — they are rotated so
+            one key hitting its rate limit doesn't stop the others.
+          </span>
         </li>
       </ol>
       <p className="setup-modal__note">
-        Once authenticated, the Gemini row will flip to ✓ Connected on
-        the next 30s poll.
+        CLI route, for an eligible account only:{" "}
+        <code>npm install -g @google/gemini-cli</code> then{" "}
+        <code>gemini auth login</code>. A saved API key takes precedence.
       </p>
     </div>
   );
@@ -215,15 +227,30 @@ function OpenAiContent({ tab, onTabChange }: OpenAiContentProps) {
             <li>
               <span className="setup-modal__step-label">Authenticate</span>
               <CommandLine cmd="codex login" />
+              <span className="setup-modal__step-hint">
+                Opens a browser — sign in with your ChatGPT account. On a
+                machine with no browser, use{" "}
+                <code>codex login --device-auth</code> instead.
+              </span>
             </li>
             <li>
               <span className="setup-modal__step-label">Verify</span>
-              <CommandLine cmd="codex --version" />
+              <CommandLine cmd="codex login status" />
+              <span className="setup-modal__step-hint">
+                Checks WHO you are signed in as, which{" "}
+                <code>codex --version</code> does not — a Codex holding a
+                dead API key answers <code>--version</code> perfectly and
+                then fails every request with{" "}
+                <code>ERROR: Reconnecting…</code>, a message that never
+                mentions authentication.
+              </span>
             </li>
           </ol>
           <p className="setup-modal__note">
-            If your Codex version is text-only, you can add an OpenAI API
-            key below as a Vision fallback in the OpenAI row above.
+            Already signed in with an API key? <code>codex login</code>{" "}
+            replaces it — nothing to clean up first. If your Codex version
+            is text-only, an OpenAI API key still works as a Vision
+            fallback in the OpenAI row above.
           </p>
         </>
       ) : (

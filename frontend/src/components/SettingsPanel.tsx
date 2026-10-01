@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useGenerationStore } from "../store/generation";
 import {
   useSettingsStore,
+  VALID_IMAGE_MODELS,
+  VALID_VIDEO_QUALITIES,
   type ImageModelKey,
   type VideoQuality,
 } from "../store/settings";
@@ -15,64 +17,61 @@ const COMMUNITY_URL = "https://www.facebook.com/groups/flowkit.flowboard.communi
  * Dashboard Settings popover anchored to the AccountPanel gear button.
  *
  * Surfaces the model context that drives every generation:
- *   - Paygate tier — auto-detected from Flow's createProject response,
- *     read-only (this isn't user-selectable, it's a fact of their plan).
- *   - Video quality — Veo 3.1 Lite / Fast / Quality, plus Ultra-only
- *     Lite Relaxed / Fast Relaxed (0-credit low-priority queue). Applies
- *     to BOTH portrait and landscape; backend resolves
- *     [tier][quality][aspect] → concrete Flow model key.
- *   - Image model — Banana Pro vs Banana 2 picker. Persisted to
- *     localStorage; every gen_image / edit_image dispatch reads it.
+ *   - Paygate tier — chosen in Settings, and a LABEL only. The batch transport
+ *     sends no tier, so entitlement is Google's answer at dispatch time.
+ *   - Video lane — the lanes this transport has a key for, plus OMNI. Written
+ *     to the localStorage settings store, which `dispatchGeneration` reads for
+ *     every canvas dispatch, so this is what gets billed.
+ *   - Image model — persisted the same way; every gen_image / edit_image
+ *     dispatch reads it.
+ *
+ * `quality` used to be offered here and has no key in `BATCH_VIDEO_LANES`, so
+ * picking it could only ever be refused. `omni` was missing while being the only
+ * family that serves text-to-video, first→last and references. Both lists were
+ * typed out by hand beside a registry that already knew better, which is how they
+ * drifted; the lane keys now come from the store's own closed list, so a lane
+ * added there without a label here fails to compile.
  */
 
-const IMAGE_MODELS: { key: ImageModelKey; label: string; hint: string }[] = [
-  {
-    key: "NANO_BANANA_PRO",
+const IMAGE_MODEL_LABELS: Record<ImageModelKey, { label: string; hint: string }> = {
+  NANO_BANANA_PRO: {
     label: "Nano Banana Pro",
     hint: "GEM_PIX_2 — premium, higher fidelity, slightly slower",
   },
-  {
-    key: "NANO_BANANA_2",
+  NANO_BANANA_2: {
     label: "Nano Banana 2",
     hint: "NARWHAL — faster, lighter checkpoint",
   },
-];
+  NANO_BANANA_2_LITE: {
+    label: "Nano Banana 2 Lite",
+    hint: "HARBOR_SEAL — lightest checkpoint",
+  },
+};
 
-// Order: lite → fast → quality (paid), then the Ultra-only relaxed
-// variants (0-credit low-priority queue). Lite/Fast/Quality are
-// available on both Pro (Tier 1) and Ultra (Tier 2); the *_relaxed
-// entries are Ultra-only — Pro users see them locked.
-const VIDEO_QUALITIES: {
-  key: VideoQuality;
-  label: string;
-  hint: string;
-  ultraOnly: boolean;
-}[] = [
-  {
-    key: "lite",
+const IMAGE_MODELS: { key: ImageModelKey; label: string; hint: string }[] =
+  VALID_IMAGE_MODELS.map((key) => ({ key, ...IMAGE_MODEL_LABELS[key] }));
+
+const VIDEO_LANE_LABELS: Record<VideoQuality, { label: string; hint: string }> = {
+  lite: {
     label: "Veo 3.1 Lite",
-    hint: "Fastest generation, lightest model. Applies to both 16:9 and 9:16.",
-    ultraOnly: false,
+    hint: "Mặc định. Nhẹ và nhanh nhất trong họ Veo. Áp cho cả 16:9 và 9:16.",
   },
-  {
-    key: "fast",
+  fast: {
     label: "Veo 3.1 Fast",
-    hint: "Default — balanced fidelity and speed. Applies to both 16:9 and 9:16.",
-    ultraOnly: false,
+    hint: "Key đắt nhất trên đường này. Tên nó mang 'Ultra' — gói Pro có gửi được hay không thì chưa đo.",
   },
-  {
-    key: "quality",
-    label: "Veo 3.1 Quality",
-    hint: "Highest fidelity, slowest. Best for hero shots. Applies to both 16:9 and 9:16.",
-    ultraOnly: false,
-  },
-  {
-    key: "lite_relaxed",
+  lite_relaxed: {
     label: "Veo 3.1 Lite (Low Priority)",
-    hint: "Same Lite checkpoint, low-priority queue — 0 credits. Slower turnaround when Flow is busy.",
-    ultraOnly: true,
+    hint: "Cùng checkpoint Lite, hàng đợi ưu tiên thấp. Gói Pro đo được là KHÔNG có làn này — Flow trả MODEL_ACCESS_DENIED, dispatch bị từ chối (không tốn credit).",
   },
-];
+  omni: {
+    label: "OMNI Flash",
+    hint: "Họ DUY NHẤT chạy được text-to-video, ảnh đầu→cuối và cổng nhân vật trên đường mới. CÓ tính credit theo thời lượng.",
+  },
+};
+
+const VIDEO_QUALITIES: { key: VideoQuality; label: string; hint: string }[] =
+  VALID_VIDEO_QUALITIES.map((key) => ({ key, ...VIDEO_LANE_LABELS[key] }));
 
 interface SettingsPanelProps {
   open: boolean;
@@ -178,32 +177,34 @@ export function SettingsPanel({ open, onClose, onLogout, logoutPending }: Settin
       <div className="settings-panel__section">
         <div className="settings-panel__label">Video model</div>
         <div className="settings-panel__radio-group">
+          {/* No lane is locked here any more. The lock read
+              `q.ultraOnly && tier !== "PAYGATE_TIER_TWO"`, with `tier` coming
+              from the Settings dropdown — a self-declared label. `routes/models.py`
+              records the opposite policy for the same reason: "a list narrowed by
+              a tier this process only half knows would hide a lane the user
+              actually has". A real Ultra user who never picked a plan — the
+              documented-as-fine default — had those lanes disabled while
+              `/api/models` listed them and the backend would dispatch them. What
+              a lane costs, or that it is refused, is said in its hint. */}
           {VIDEO_QUALITIES.map((q) => {
-            const locked = q.ultraOnly && tier !== "PAYGATE_TIER_TWO";
             const checked = videoModel === "veo" && videoQuality === q.key;
             return (
               <label
                 key={q.key}
-                className={`settings-panel__radio${checked ? " settings-panel__radio--active" : ""}${locked ? " settings-panel__radio--locked" : ""}`}
+                className={`settings-panel__radio${checked ? " settings-panel__radio--active" : ""}`}
               >
                 <input
                   type="radio"
                   name="video-model"
                   value={`veo:${q.key}`}
                   checked={checked}
-                  disabled={locked}
                   onChange={() => {
                     setVideoModel("veo");
                     setVideoQuality(q.key);
                   }}
                 />
                 <div>
-                  <div className="settings-panel__radio-label">
-                    {q.label}
-                    {q.ultraOnly && (
-                      <span className="model-badge">Ultra only</span>
-                    )}
-                  </div>
+                  <div className="settings-panel__radio-label">{q.label}</div>
                   <div className="settings-panel__radio-hint">{q.hint}</div>
                 </div>
               </label>

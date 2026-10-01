@@ -49,6 +49,40 @@ export interface FlowboardNodeData extends Record<string, unknown> {
   // the previous variant.
   slotErrors?: (string | null)[];
   variantCount?: number;
+  // Positional twin of `mediaIds`: clip *i* came from operation *i*. An upscale
+  // addresses the OPERATION and the MEDIA in different payload slots, and the
+  // capture warns that swapping them is accepted and then fails NOT_FOUND — so
+  // the operation id cannot be derived and has to be kept.
+  operationNames?: (string | null)[];
+  // The Flow model key that produced the clip. Extend reads it: Flow only
+  // extends Veo, and greys the button out for `abra_*` (Omni).
+  sourceModelKey?: string;
+  // The 1080p upscale, as a SECOND artefact. Never `mediaId` — the original is
+  // what was paid for, and replacing it is a loss with no undo.
+  upscaledMediaId?: string;
+  // The Flow scene this clip was wrapped into, and the clone it produced. Link 1
+  // of an extend chain references the clone; a second scene for the same clip
+  // would restart the chain at position 1.
+  sceneId?: string;
+  sceneCloneMediaId?: string;
+  // The extension chain, oldest first. `extensionOperationIds` is aligned with
+  // it because link *n+1* must reference link *n*'s OPERATION id.
+  extensionMediaIds?: string[];
+  extensionOperationIds?: string[];
+  // Which service draws this node's image: "flow" (the default everywhere,
+  // and what every packaged template means) or "openai". Absent is not the
+  // same as "flow" — it means the node never expressed a preference, so the
+  // dispatch leaves the choice out rather than stamping one in.
+  imageEngine?: "flow" | "openai";
+  // Which composer runs when the prompt box is left empty: one model, every
+  // model with a judge, or the three-stage relay that checks its own output.
+  // P3 built all three and left the choice unreachable — `/auto` was the only
+  // one any screen called.
+  promptMode?: "single" | "ensemble" | "relay";
+  // Which registered character of the board's Flow project this node stands
+  // for. The run sends its `entityId` as `referenceEntities`; without a link
+  // the node is an ordinary reference image.
+  characterId?: string;
   // The aspect-ratio enum the asset was generated / uploaded at — used to
   // default-match downstream gen dialogs (e.g. a 9:16 visual_asset feeds
   // into a downstream image / video that defaults to 9:16). Values are
@@ -59,6 +93,12 @@ export interface FlowboardNodeData extends Record<string, unknown> {
   // AI-generated factual description of mediaId (set by /api/vision/describe).
   // Spliced into auto-prompts on downstream nodes for richer context.
   aiBrief?: string;
+  // Set only on nodes imported from a packaged workflow file: the original
+  // exe node type and its settings, kept verbatim. The canvas does not act
+  // on them, but they are the record of what the step was configured to do
+  // and cannot be re-derived once dropped.
+  sourceType?: string;
+  sourceSettings?: Record<string, unknown>;
   aiBriefStatus?: "pending" | "done" | "failed";
   // Transient status while the GenerationDialog runs `autoPrompt` /
   // `autoPromptBatch` against this node — set to "pending" while the
@@ -103,21 +143,76 @@ export type FlowNode = Node<FlowboardNodeData>;
 // backend. `sourceVariantIdx` mirrors `EdgeDTO.source_variant_idx`.
 export interface FlowboardEdgeData extends Record<string, unknown> {
   sourceVariantIdx?: number | null;
+  /** The named sockets this wire connects, when it has them. The executor
+   *  tells a start frame from a character reference by these. */
+  sourcePort?: string | null;
+  targetPort?: string | null;
 }
 
 /** Map an EdgeDTO from the backend into ReactFlow's Edge shape, carrying
  * the variant pin through `data` so dispatch + edge UI can read it. */
+/** Which socket a hand-drawn wire lands on.
+ *
+ * The canvas gives each node one handle per side, so the user cannot pick a
+ * port and the wire used to arrive nameless. The executor tells a start frame
+ * from a character reference BY the port, so nameless left it guessing, and the
+ * guess it made — reference sheet as opening frame — bought a paid clip of a
+ * contact sheet. It also meant the `character_N` sockets could only ever be
+ * reached by importing a JSON file.
+ *
+ * Inferred from the pair of node types, the same way `template_import` infers
+ * it for the packaged workflows. Returning null means "let the backend read it
+ * by type", which is right for the ordinary image → video chain.
+ */
+function inferTargetPort(
+  sourceRfId: string,
+  targetRfId: string,
+  nodes: FlowNode[],
+  edges: Edge<FlowboardEdgeData>[],
+): string | null {
+  const src = nodes.find((n) => n.id === sourceRfId);
+  const dst = nodes.find((n) => n.id === targetRfId);
+  if (!src || !dst) return null;
+
+  // A character feeding a video is Component mode: named entity sockets, not a
+  // start frame. Numbered in wiring order, because the number is the order the
+  // characters appear in the prompt and swapping two of them is a different
+  // video.
+  if (src.data.type === "character" && dst.data.type === "video") {
+    const taken = edges.filter(
+      (e) =>
+        e.target === targetRfId
+        && typeof e.data?.targetPort === "string"
+        && e.data.targetPort.startsWith("character_"),
+    ).length;
+    return `character_${taken + 1}`;
+  }
+  // A prompt feeds text, and naming it stops the wire from reading as an empty
+  // start-frame socket — which is why the simplest board anyone can draw
+  // (prompt → video) refused to run.
+  if (src.data.type === "prompt") return "prompt";
+  return null;
+}
+
 function edgeFromDto(dto: {
   id: number;
   source_id: number;
   target_id: number;
   source_variant_idx?: number | null;
+  source_port?: string | null;
+  target_port?: string | null;
 }): Edge<FlowboardEdgeData> {
   return {
     id: String(dto.id),
     source: String(dto.source_id),
     target: String(dto.target_id),
-    data: { sourceVariantIdx: dto.source_variant_idx ?? null },
+    data: {
+      sourceVariantIdx: dto.source_variant_idx ?? null,
+      // Carried so the next wire can count the character sockets already
+      // taken. Dropped, every new character wire would be `character_1`.
+      sourcePort: dto.source_port ?? null,
+      targetPort: dto.target_port ?? null,
+    },
   };
 }
 
@@ -142,6 +237,19 @@ const TYPE_TITLE: Record<NodeType, string> = {
   note: "Note",
   visual_asset: "Visual asset",
   Storyboard: "Storyboard",
+  motion_control: "Hoán đổi cử động",
+  // Post-production. Vietnamese, because these are the labels the packaged
+  // tool used and the user reads the board in Vietnamese.
+  analyze_video: "Phân tích video",
+  merge_video: "Ghép video",
+  edit_video: "Sửa video",
+  extract_last_frame: "Lấy frame cuối",
+  add_bgm: "Nhạc nền",
+  create_voice: "Tạo giọng đọc",
+  align_video_voice: "Khớp video · giọng",
+  sync_image_voice: "Ảnh + giọng → video",
+  remove_watermark: "Xoá watermark",
+  review_video: "Chấm điểm clip",
 };
 
 // ── Persisted active-board id ─────────────────────────────────────────────
@@ -277,12 +385,43 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           variantCount: n.data["variantCount"] as number | undefined,
           aspectRatio: n.data["aspectRatio"] as string | undefined,
           aiBrief: n.data["aiBrief"] as string | undefined,
+          sourceType: n.data["sourceType"] as string | undefined,
+          sourceSettings: n.data["sourceSettings"] as
+            | Record<string, unknown>
+            | undefined,
           imageModel: n.data["imageModel"] as string | undefined,
+          imageEngine: n.data["imageEngine"] as "flow" | "openai" | undefined,
+          characterId: n.data["characterId"] as string | undefined,
+          promptMode: n.data["promptMode"] as
+            | "single"
+            | "ensemble"
+            | "relay"
+            | undefined,
           videoQuality: n.data["videoQuality"] as string | undefined,
           charCountry: n.data["charCountry"] as string | undefined,
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          // Kept so upscale and extend stay reachable after a reload. The
+          // extend chain in particular: without `extensionOperationIds` the
+          // next link falls back to the clone, restarts from the start of the
+          // clip, and bills for it.
+          operationNames: n.data["operationNames"] as (string | null)[] | undefined,
+          sourceModelKey: n.data["sourceModelKey"] as string | undefined,
+          upscaledMediaId: n.data["upscaledMediaId"] as string | undefined,
+          sceneId: n.data["sceneId"] as string | undefined,
+          sceneCloneMediaId: n.data["sceneCloneMediaId"] as string | undefined,
+          extensionMediaIds: n.data["extensionMediaIds"] as string[] | undefined,
+          extensionOperationIds: n.data["extensionOperationIds"] as
+            | string[]
+            | undefined,
+          // `renderedAt` was hydrated by none of the three loaders while eight
+          // sites persist it, so "vừa xong" became "—" on the first reload and
+          // the timestamp sat in the database unreachable. `error` was hydrated
+          // by `refreshBoardState` only, so a failed node came back from a reload
+          // showing the red strip with no reason on it.
+          renderedAt: n.data["renderedAt"] as string | undefined,
+          error: n.data["error"] as string | undefined,
         },
       }));
 
@@ -333,12 +472,38 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           variantCount: n.data["variantCount"] as number | undefined,
           aspectRatio: n.data["aspectRatio"] as string | undefined,
           aiBrief: n.data["aiBrief"] as string | undefined,
+          sourceType: n.data["sourceType"] as string | undefined,
+          sourceSettings: n.data["sourceSettings"] as
+            | Record<string, unknown>
+            | undefined,
           imageModel: n.data["imageModel"] as string | undefined,
+          imageEngine: n.data["imageEngine"] as "flow" | "openai" | undefined,
+          characterId: n.data["characterId"] as string | undefined,
+          promptMode: n.data["promptMode"] as
+            | "single"
+            | "ensemble"
+            | "relay"
+            | undefined,
           videoQuality: n.data["videoQuality"] as string | undefined,
           charCountry: n.data["charCountry"] as string | undefined,
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          // Kept so upscale and extend stay reachable after a reload. The
+          // extend chain in particular: without `extensionOperationIds` the
+          // next link falls back to the clone, restarts from the start of the
+          // clip, and bills for it.
+          operationNames: n.data["operationNames"] as (string | null)[] | undefined,
+          sourceModelKey: n.data["sourceModelKey"] as string | undefined,
+          upscaledMediaId: n.data["upscaledMediaId"] as string | undefined,
+          sceneId: n.data["sceneId"] as string | undefined,
+          sceneCloneMediaId: n.data["sceneCloneMediaId"] as string | undefined,
+          extensionMediaIds: n.data["extensionMediaIds"] as string[] | undefined,
+          extensionOperationIds: n.data["extensionOperationIds"] as
+            | string[]
+            | undefined,
+          renderedAt: n.data["renderedAt"] as string | undefined,
+          error: n.data["error"] as string | undefined,
         },
       }));
       const edges: Edge[] = detail.edges.map(edgeFromDto);
@@ -416,13 +581,42 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           slotErrors: n.data["slotErrors"] as (string | null)[] | undefined,
           variantCount: n.data["variantCount"] as number | undefined,
           aiBrief: n.data["aiBrief"] as string | undefined,
+          sourceType: n.data["sourceType"] as string | undefined,
+          sourceSettings: n.data["sourceSettings"] as
+            | Record<string, unknown>
+            | undefined,
           imageModel: n.data["imageModel"] as string | undefined,
+          imageEngine: n.data["imageEngine"] as "flow" | "openai" | undefined,
+          characterId: n.data["characterId"] as string | undefined,
+          promptMode: n.data["promptMode"] as
+            | "single"
+            | "ensemble"
+            | "relay"
+            | undefined,
           videoQuality: n.data["videoQuality"] as string | undefined,
           charCountry: n.data["charCountry"] as string | undefined,
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          // Kept so upscale and extend stay reachable after a reload. The
+          // extend chain in particular: without `extensionOperationIds` the
+          // next link falls back to the clone, restarts from the start of the
+          // clip, and bills for it.
+          operationNames: n.data["operationNames"] as (string | null)[] | undefined,
+          sourceModelKey: n.data["sourceModelKey"] as string | undefined,
+          upscaledMediaId: n.data["upscaledMediaId"] as string | undefined,
+          sceneId: n.data["sceneId"] as string | undefined,
+          sceneCloneMediaId: n.data["sceneCloneMediaId"] as string | undefined,
+          extensionMediaIds: n.data["extensionMediaIds"] as string[] | undefined,
+          extensionOperationIds: n.data["extensionOperationIds"] as
+            | string[]
+            | undefined,
           error: n.data["error"] as string | undefined,
+          // Missing here and only here, on the loader a board run calls every
+          // 1500 ms. Losing it mid-run made `pickDefaultAspect` read `undefined`
+          // upstream and bill a landscape clip from a portrait source.
+          aspectRatio: n.data["aspectRatio"] as string | undefined,
+          renderedAt: n.data["renderedAt"] as string | undefined,
         },
       }));
       const edges: Edge[] = detail.edges.map(edgeFromDto);
@@ -570,13 +764,19 @@ export const useBoardStore = create<BoardState>((set, get) => ({
   },
 
   async addEdgeFromConnection(source, target) {
-    const { boardId } = get();
+    const { boardId, nodes, edges } = get();
     if (boardId === null) return;
     const sourceId = parseInt(source, 10);
     const targetId = parseInt(target, 10);
     if (isNaN(sourceId) || isNaN(targetId)) return;
+    const targetPort = inferTargetPort(source, target, nodes, edges);
     try {
-      const dto = await createEdge({ board_id: boardId, source_id: sourceId, target_id: targetId });
+      const dto = await createEdge({
+        board_id: boardId,
+        source_id: sourceId,
+        target_id: targetId,
+        ...(targetPort ? { target_port: targetPort } : {}),
+      });
       set((s) => ({ edges: [...s.edges, edgeFromDto(dto)] }));
     } catch {
       // ignore

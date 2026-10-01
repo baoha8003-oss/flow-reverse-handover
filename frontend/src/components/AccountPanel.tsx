@@ -1,137 +1,148 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   getAuthMe,
   logoutExtension,
   scanExtension,
   type AuthMe,
+  type AuthScanResult,
 } from "../api/client";
 import { useGenerationStore } from "../store/generation";
 import { getLatestRelease, isNewerVersion, type LatestRelease } from "../api/github";
 import { SettingsPanel } from "./SettingsPanel";
 import packageJson from "../../package.json";
 
+//: How often to re-ask the bridge. 30s, matching `ForcedSetupGate` and the
+//: other pollers. Was 8s, and each tick is a MAIN-world injection into the
+//: user's Flow tab — see the effect below.
+const ACCOUNT_POLL_INTERVAL_MS = 30_000;
+
 const APP_VERSION: string = packageJson.version;
 
 /**
  * Account chip pinned to the bottom of the project sidebar.
  *
- * Identity (name / email / avatar) flows: extension grabs the Bearer
- * token → calls Google's /oauth2/v2/userinfo → pushes the profile to
- * the agent over WebSocket → we read it from /api/auth/me here.
+ * It used to show an identity: the extension captured a Bearer token, called
+ * Google's userinfo endpoint, and this chip rendered the name, email and avatar
+ * that came back. Google's September 2026 Flow migration removed the token —
+ * the page signs its own calls now and never hands a credential to this app —
+ * so there is no identity to show and `/api/auth/me` returns nulls.
  *
- * Polled every 5s so the chip backfills automatically once the
- * extension finishes the userinfo round-trip after a fresh sign-in.
- * Stops polling once we have an email — no need to keep hitting it.
+ * What the chip reports instead is the thing the user actually needs from it:
+ * can a generation be dispatched right now. Three states, three different
+ * fixes, and telling them apart is the whole point — the second one looked
+ * healthy for a week:
  *
- * When the sidebar is collapsed (44px wide), render only the avatar +
- * cog stacked vertically so the chip still fits.
+ *   1. the extension is not connected — reload it in chrome://extensions;
+ *   2. it is connected but no Flow tab can sign a call — open or sign in to
+ *      https://flow.google.com/ and leave the tab open;
+ *   3. signed, nothing to do.
+ *
+ * Everything here is presence, never values: whether the page carries its
+ * signing token, not what the token is.
  */
 export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
   const setStorePaygateTier = useGenerationStore.setState;
   const [open, setOpen] = useState(false);
   const [profile, setProfile] = useState<AuthMe | null>(null);
-  // Counts polls that returned a profile but no tier. Used to delay
-  // the "Tier unknown" banner so it doesn't flash on initial cold-start
-  // while the extension is still doing its first round-trip.
-  const [pollsWithoutTier, setPollsWithoutTier] = useState(0);
-  // Scan / logout transient state for button affordances.
-  const [scanState, setScanState] = useState<"idle" | "scanning" | "no-extension">("idle");
+  const [scan, setScan] = useState<AuthScanResult | null>(null);
+  const [scanState, setScanState] = useState<"idle" | "scanning">("idle");
   const [logoutPending, setLogoutPending] = useState(false);
-  // Bumped by handleScan / handleLogout to kick the poll effect into
-  // re-running immediately instead of waiting for the next 5s tick.
   const [pollNonce, setPollNonce] = useState(0);
+  //: Shared by the poll loop and the manual "Kiểm tra tab Flow" button, so the
+  //: two cannot inject into the Flow tab at the same moment.
+  const probeInFlight = useRef(false);
 
-  // Poll /api/auth/me until BOTH email and paygate_tier are populated.
-  // Email comes from Google's userinfo (fetched once per token rotation
-  // by the extension); tier is resolved by the agent against /v1/credits
-  // on token capture, which can take a beat longer than userinfo to land.
+  // Poll `/api/auth/me` for the chosen plan and the last probe result, and
+  // `/api/auth/scan` for a fresh bridge state.
+  //
+  // `/scan` is NOT a cheap status read, and the comment here used to say it was
+  // ("both are free and generate nothing" — true about billing, misleading about
+  // cost). It reaches `flow_probe`, which runs
+  // `chrome.scripting.executeScript({world:'MAIN'})` inside the user's signed-in
+  // Flow tab: a page injection with the page's full privileges. At the old 8s
+  // cadence, with no visibility gate and this panel mounted for the whole
+  // session, that was ~450 injections an hour whether or not anyone was looking.
+  //
+  // Worse, `runFlowProbe` calls `reviveTabIfNeeded`, which RELOADS a discarded
+  // tab (`extension/background.js`). Chrome discarding a backgrounded tab is
+  // normal, so the loop turned that into a reload of flow.google.com every ~10.5s
+  // for as long as Flowboard stayed open — a Flow tab that never stopped loading.
+  //
+  // The states `describeState` distinguishes (tab closed, session expired) change
+  // on human timescales, so 30s plus an immediate refresh when the window regains
+  // focus answers strictly sooner in the case that matters. Gate + listener copied
+  // from `ForcedSetupGate`, which is the pattern the other four pollers use.
   useEffect(() => {
     let alive = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      const me = await getAuthMe();
-      if (!alive) return;
-      setProfile(me);
-      // Mirror the tier into the generation store so dispatch paths
-      // continue to read from a single source. When tier becomes null
-      // again (extension disconnect / sign-out), clear the store too —
-      // otherwise dispatch would happily reuse a stale tier.
-      if (me?.paygate_tier) {
-        setStorePaygateTier({ paygateTier: me.paygate_tier });
-        setPollsWithoutTier(0);
-      } else if (me?.email) {
-        // Email present but tier missing — extension connected but
-        // hasn't sniffed a Flow request body yet. Count up so the UI
-        // knows when to surface the warning banner.
-        setStorePaygateTier({ paygateTier: null });
-        setPollsWithoutTier((n) => n + 1);
+    const refresh = async () => {
+      // Never two probes in the same tab at once. The loop and the "Kiểm tra tab
+      // Flow" button share this ref, because pressing the button mid-tick used to
+      // put two MAIN-world injections into the page simultaneously.
+      if (probeInFlight.current) return;
+      probeInFlight.current = true;
+      try {
+        const me = await getAuthMe();
+        if (!alive) return;
+        setProfile(me);
+        // Mirror the plan into the generation store so every dispatch path reads
+        // one source. It is a label — nothing is gated on it — but a stale one
+        // would put the wrong price on screen.
+        setStorePaygateTier({ paygateTier: me?.paygate_tier ?? null });
+        const state = await scanExtension();
+        if (alive) setScan(state);
+      } catch {
+        if (alive) setScan(null);
+      } finally {
+        probeInFlight.current = false;
       }
-      if (me?.email && me?.paygate_tier) return;
-      timer = setTimeout(poll, 5000);
     };
-    poll();
+    void refresh();
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, ACCOUNT_POLL_INTERVAL_MS);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       alive = false;
-      if (timer) clearTimeout(timer);
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [setStorePaygateTier, pollNonce]);
 
-  // Logout: clears agent-side cache + tells extension to drop in-memory
-  // identity. Resets local state immediately so the chip flips to the
-  // "Not connected" affordance without waiting for the next poll tick.
   async function handleLogout() {
     if (logoutPending) return;
     setLogoutPending(true);
     try {
       await logoutExtension();
-      setProfile({
-        email: null,
-        name: null,
-        picture: null,
-        verified_email: null,
-        paygate_tier: null,
-        sku: null,
-        credits: null,
-      });
-      setStorePaygateTier({ paygateTier: null });
-      setPollsWithoutTier(0);
       setPollNonce((n) => n + 1);
     } catch {
-      // non-fatal: re-poll will reflect the real state in 5s anyway
+      // non-fatal: the next poll reflects the real state anyway
     } finally {
       setLogoutPending(false);
     }
   }
 
-  // Scan: probe the extension state and, if a connection is open but
-  // userinfo is missing, ask the extension to re-fetch from Google.
-  // The poll loop above picks up the new state on the next /me hit.
   async function handleScan() {
-    if (scanState === "scanning") return;
+    // `scanState` guards this button against ITSELF; `probeInFlight` guards it
+    // against the poll loop. Both are needed: the old code had only the first, so
+    // pressing it mid-tick issued a second MAIN-world injection into the same Flow
+    // tab while the first was still running.
+    if (scanState === "scanning" || probeInFlight.current) return;
     setScanState("scanning");
+    probeInFlight.current = true;
     try {
-      const res = await scanExtension();
-      if (!res.extension_connected) {
-        setScanState("no-extension");
-        // Auto-clear the warning after 8s so the button doesn't get
-        // stuck — gives the user time to read it but recovers on its own.
-        setTimeout(() => setScanState("idle"), 8000);
-        return;
-      }
-      // Extension is alive — kick the poll loop so the chip refreshes
-      // as soon as userinfo lands. The 5s default would feel sluggish
-      // right after a deliberate user action.
-      setPollNonce((n) => n + 1);
-      setScanState("idle");
+      setScan(await scanExtension());
     } catch {
+      setScan(null);
+    } finally {
+      probeInFlight.current = false;
       setScanState("idle");
+      setPollNonce((n) => n + 1);
     }
   }
 
-  // Surface "new version available" right under the account chip so
-  // users notice without having to open Settings. GitHub's release
-  // endpoint is cached by the helper (sessionStorage, 1h) so this
-  // doesn't burn API quota on every mount.
   const [latestRelease, setLatestRelease] = useState<LatestRelease | null>(null);
   useEffect(() => {
     let alive = true;
@@ -143,159 +154,93 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
     };
   }, []);
   const updateAvailable =
-    !!latestRelease?.tagName &&
-    isNewerVersion(latestRelease.tagName, APP_VERSION);
+    !!latestRelease?.tagName && isNewerVersion(latestRelease.tagName, APP_VERSION);
 
   const tier = profile?.paygate_tier ?? null;
+  const tierLabel =
+    tier === "PAYGATE_TIER_TWO" ? "Ultra" : tier === "PAYGATE_TIER_ONE" ? "Pro" : "—";
 
-  const displayName = profile?.name?.trim() || "Flow account";
-  const email = profile?.email ?? null;
-  const picture = profile?.picture ?? null;
-  const initial = displayName.slice(0, 1).toUpperCase();
-  const credits = profile?.credits ?? null;
-  // Format credits with locale-aware thousand separators so 24340 →
-  // "24,340". Tabular-nums in CSS keeps the digits aligned even when
-  // the value updates (e.g. after a generation).
-  const creditsLabel =
-    credits !== null
-      ? new Intl.NumberFormat("en-US").format(credits)
-      : null;
-
-  // Google Flow plan tiers — both are paid (Flowboard's hard
-  // requirement). TIER_TWO = Ultra (higher tier), TIER_ONE = Pro.
-  const tierLabel = tier === "PAYGATE_TIER_TWO"
-    ? "Ultra"
-    : tier === "PAYGATE_TIER_ONE"
-      ? "Pro"
-      : "—";
+  const connected = scan?.extension_connected ?? null;
+  const signed = scan?.flow_tab_signed ?? false;
+  const ready = connected === true && signed;
+  const state = describeState(scan);
 
   return (
     <>
       <div
         className={`account-panel${collapsed ? " account-panel--collapsed" : ""}${
-          !email ? " account-panel--disconnected" : ""
+          ready ? "" : " account-panel--disconnected"
         }`}
         role="region"
         aria-label="Account"
       >
-        {/* Avatar + cog only render when an extension session is live —
-            without an email there's no profile to show and the settings
-            panel has no actionable controls (logout disabled). */}
-        {email && (
-          <div
-            className={`account-panel__avatar${picture ? " account-panel__avatar--photo" : ""}`}
-            title={collapsed ? `${displayName} · ${tierLabel}` : undefined}
-            aria-hidden="true"
-          >
-            {picture ? (
-              <img
-                src={picture}
-                alt=""
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  // Google avatar URL can 403 if the user signed out —
-                  // hide the broken image and let the initial fallback
-                  // shine through.
-                  (e.currentTarget as HTMLImageElement).style.display = "none";
-                }}
-              />
-            ) : (
-              initial
-            )}
-          </div>
-        )}
-        {!collapsed && email && (
-          // Connected — three stacked rows: name, email, status (tier
-          // + credits). Tier badge moved out of the name row so the
-          // name has full width and doesn't ellipsize on narrow
-          // sidebars; credits join it in the status row so all the
-          // "subscription state" info reads as one unit.
+        <div
+          className="account-panel__avatar"
+          title={collapsed ? `${state.short} · ${tierLabel}` : undefined}
+          aria-hidden="true"
+        >
+          {ready ? "✓" : "!"}
+        </div>
+        {!collapsed && (
           <div className="account-panel__meta">
-            <span className="account-panel__name" title={displayName}>{displayName}</span>
-            <span className="account-panel__email" title={email}>{email}</span>
-            {(tier || creditsLabel) && (
-              <div
-                className="account-panel__status-row"
-                title={tier ? `${tierLabel}${creditsLabel ? ` · ${creditsLabel} credits remaining` : ""}` : undefined}
+            <span className="account-panel__name">Google Flow</span>
+            <span className="account-panel__state" title={state.hint}>
+              {state.short}
+            </span>
+            <div className="account-panel__status-row">
+              <span
+                className={`account-panel__tier${
+                  tier === "PAYGATE_TIER_TWO"
+                    ? " account-panel__tier--ultra"
+                    : " account-panel__tier--pro"
+                }`}
               >
-                {tier && (
-                  <span
-                    className={`account-panel__tier${
-                      tier === "PAYGATE_TIER_TWO"
-                        ? " account-panel__tier--ultra"
-                        : " account-panel__tier--pro"
-                    }`}
-                  >
-                    {tierLabel}
-                  </span>
-                )}
-                {creditsLabel && (
-                  <span
-                    className="account-panel__credits-inline"
-                    title={`${creditsLabel} credits remaining`}
-                  >
-                    <span className="account-panel__credits-value">{creditsLabel}</span>
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-        {!collapsed && !email && (
-          // Disconnected — skip the placeholder "Flow account" / "Connected
-          // via extension" copy entirely. When the scan probe says no
-          // extension is reachable, swap the bare button for a short
-          // recovery hint so the user knows the concrete next steps
-          // (refresh the Flow tab, reload the extension) instead of
-          // bouncing off a generic "not found" warning.
-          <div className="account-panel__meta account-panel__meta--disconnected">
-            {scanState === "no-extension" ? (
-              <div className="account-panel__scan-hint" role="alert">
-                <span className="account-panel__scan-hint-title">
-                  ⚠ Extension not detected
-                </span>
-                <span className="account-panel__scan-hint-text">
-                  Refresh the Flow tab, then reload the Flowboard extension.
-                </span>
-                <button
-                  type="button"
-                  className="account-panel__scan-btn"
-                  onClick={handleScan}
-                  title="Scan again for an extension connection"
-                >
-                  Try again
-                </button>
-              </div>
-            ) : (
+                {tierLabel}
+              </span>
               <button
                 type="button"
                 className="account-panel__scan-btn"
                 onClick={handleScan}
                 disabled={scanState === "scanning"}
-                title="Scan for an extension connection and re-fetch user info"
+                title="Hỏi lại tab Flow xem có ký được không. Không tốn credit."
               >
-                {scanState === "scanning" ? "Scanning…" : "🔍 Scan extension"}
+                {scanState === "scanning" ? "Đang kiểm…" : "Kiểm tra tab Flow"}
               </button>
-            )}
+            </div>
           </div>
         )}
-        {email && (
-          <button
-            type="button"
-            className="account-panel__cog"
-            onClick={() => setOpen((v) => !v)}
-            aria-label="Open settings"
-            title="Settings"
-          >
-            ⚙
-          </button>
-        )}
+        <button
+          type="button"
+          className="account-panel__cog"
+          onClick={() => setOpen((v) => !v)}
+          aria-label="Open settings"
+          title="Settings"
+        >
+          ⚙
+        </button>
       </div>
+      {!collapsed && !ready && connected !== null && (
+        // The actionable half. Named after what is wrong, because "not
+        // connected" covered a bridge that was down and a page that could not
+        // sign — and only one of those is fixed in chrome://extensions.
+        <div className="account-panel__scan-hint" role="alert">
+          <span className="account-panel__scan-hint-title">⚠ {state.short}</span>
+          <span className="account-panel__scan-hint-text">{state.hint}</span>
+        </div>
+      )}
       {!collapsed && (
         <div className="account-panel__version-row">
           <span className="account-panel__version-label">
             Flowboard <code>v{APP_VERSION}</code>
           </span>
+          {scan?.extension_version && (
+            <span
+              className="account-panel__version-label"
+              title="Bản extension đang chạy trong Chrome"
+            >
+              <code>ext {scan.extension_version}</code>
+            </span>
+          )}
           {updateAvailable && latestRelease && (
             <a
               className="account-panel__update-pill"
@@ -309,45 +254,80 @@ export function AccountPanel({ collapsed = false }: { collapsed?: boolean }) {
           )}
         </div>
       )}
-      {!collapsed && profile?.email && !profile.paygate_tier && pollsWithoutTier >= 2 && (
-        // Extension connected (we got the Google profile) but hasn't
-        // sniffed a Flow request body yet — tier is unknown. Without
-        // this banner, the user would either see an empty tier slot
-        // (silently, before v1.1.5) or get a "paygate_tier_unknown"
-        // dispatch error with no recovery hint. Surface the gap and
-        // give a 1-click path to fix it.
+      {!collapsed && scan && !scan.has_paygate_tier && (
+        // The plan is unset. It used to be detectable — the extension sniffed a
+        // Bearer token and the agent asked `/v1/credits` — and this banner said
+        // "open Flow once". Both are gone, so the recovery is a dropdown rather
+        // than a page visit. Generation is NOT blocked by this: the plan only
+        // decides which lanes are listed and which price is quoted.
         <div className="account-panel__tier-warning" role="alert">
-          <span className="account-panel__tier-warning-icon" aria-hidden="true">⚠</span>
+          <span className="account-panel__tier-warning-icon" aria-hidden="true">
+            ⚠
+          </span>
           <div className="account-panel__tier-warning-body">
-            <span className="account-panel__tier-warning-title">
-              Tier unknown
-            </span>
+            <span className="account-panel__tier-warning-title">Chưa chọn gói Flow</span>
             <span className="account-panel__tier-warning-text">
-              Open Flow once so the extension can detect your plan.
+              Bản mới của Flow không cho đọc gói tự động. Chọn Pro/Ultra trong Cài
+              đặt để bảng giá hiện đúng — không chọn thì vẫn chạy được.
             </span>
           </div>
-          <a
+          <button
+            type="button"
             className="account-panel__tier-warning-cta"
-            href="https://labs.google/fx/tools/flow"
-            target="_blank"
-            rel="noopener noreferrer"
+            onClick={() => setOpen(true)}
           >
-            Open Flow ↗
-          </a>
+            Mở Cài đặt
+          </button>
         </div>
       )}
       <SettingsPanel
         open={open}
         onClose={() => setOpen(false)}
-        // Sign out lives in Settings now — only render the action when
-        // there's actually a session to drop (no `email` = nothing to
-        // sign out from).
-        onLogout={email ? async () => {
+        // Kept because the frontend offers it and telling the extension is
+        // harmless. What it cannot do is sign the user out: the Flow session
+        // lives in Chrome's own cookie jar, which this app does not touch.
+        onLogout={async () => {
           await handleLogout();
           setOpen(false);
-        } : undefined}
+        }}
         logoutPending={logoutPending}
       />
     </>
   );
+}
+
+/** One short label and one actionable sentence per bridge state. */
+export function describeState(scan: AuthScanResult | null): {
+  short: string;
+  hint: string;
+} {
+  if (scan === null) {
+    return {
+      short: "Chưa kiểm tra",
+      hint: "Chưa hỏi được agent. Kiểm tra agent có đang chạy không.",
+    };
+  }
+  if (!scan.extension_connected) {
+    return {
+      short: "Extension chưa nối",
+      hint: "Mở chrome://extensions và bấm Reload cho Flowboard.",
+    };
+  }
+  if (!scan.flow_tab_present) {
+    return {
+      short: "Chưa có tab Flow",
+      hint:
+        "Mở https://flow.google.com/ , đăng nhập, và để tab đó mở — mọi lệnh " +
+        "gửi Flow đều chạy bên trong nó.",
+    };
+  }
+  if (!scan.flow_tab_signed) {
+    return {
+      short: "Tab Flow chưa ký được",
+      hint:
+        "Có tab Flow nhưng trang chưa ký được: hoặc chưa đăng nhập, hoặc app " +
+        "đang tải. Đăng nhập rồi đợi load xong, sau đó bấm kiểm tra lại.",
+    };
+  }
+  return { short: "Sẵn sàng", hint: "Tab Flow ký được — lệnh gửi Flow sẽ chạy." };
 }

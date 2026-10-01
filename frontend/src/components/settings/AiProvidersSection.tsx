@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getLlmConfig,
   getLlmProviders,
+  recheckLlmProviders,
+  setLlmApiKey,
   setLlmConfig,
   testLlmProvider,
   type LLMConfig,
@@ -9,6 +11,7 @@ import {
   type LLMProviderName,
 } from "../../api/client";
 import { ProviderCard } from "./ProviderCard";
+import { ProviderHealthPanel } from "./ProviderHealthPanel";
 import { ProviderSetupModal } from "./ProviderSetupModal";
 
 /**
@@ -49,6 +52,13 @@ const SHOWN_PROVIDERS: LLMProviderName[] = ["gemini", "claude", "openai"];
 // passes the test gate fastest. The user can still click any other card —
 // this just gives them a sensible starting point instead of a blank panel.
 const FIRST_RUN_DEFAULT: LLMProviderName = "gemini";
+/** Providers with a REST mode, where pasting a key is a complete setup path.
+ *
+ * This matters more than it looks: Google retired the Gemini CLI's login for
+ * individual accounts (`IneligibleTierError … migrate to Antigravity`), so for
+ * most people the CLI route is closed and a key is the only way in. Claude is
+ * CLI-only here and is deliberately absent. */
+const API_KEY_PROVIDERS = new Set<LLMProviderName>(["gemini", "openai"]);
 
 // CLI install reference — shown as a footer under the test checklist so
 // users know how to upgrade / reinstall the CLI without leaving the
@@ -108,6 +118,7 @@ export function AiProvidersSection() {
   const [applying, setApplying] = useState(false);
   const [helpFor, setHelpFor] = useState<LLMProviderName | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [rechecking, setRechecking] = useState(false);
 
   const aliveRef = useRef(true);
   useEffect(() => {
@@ -127,6 +138,28 @@ export function AiProvidersSection() {
     } catch (err) {
       if (!aliveRef.current) return;
       setLoadError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  /**
+   * Force the backend to drop its cached auth/availability probes.
+   *
+   * The plain `refresh` above reads cached state, and the cache holds for
+   * 60s. After a `codex login` in another window that is long enough for
+   * the user to conclude the sign-in did not take.
+   */
+  const recheck = useCallback(async () => {
+    setRechecking(true);
+    try {
+      const p = await recheckLlmProviders();
+      if (!aliveRef.current) return;
+      setProviders(p);
+      setLoadError(null);
+    } catch (err) {
+      if (!aliveRef.current) return;
+      setLoadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (aliveRef.current) setRechecking(false);
     }
   }, []);
 
@@ -285,6 +318,11 @@ export function AiProvidersSection() {
         </div>
       )}
 
+      {/* Placed above the cards on purpose: when something is broken this
+          is the row that says which thing, and a user opens this dialog
+          because something already went wrong. */}
+      <ProviderHealthPanel />
+
       <div className="provider-group">
         <div className="provider-group__title">OAuth Providers</div>
         <div className="provider-group__cards">
@@ -315,7 +353,7 @@ export function AiProvidersSection() {
               </div>
               <div className="selection-panel__setup-text">
                 {pendingProvider.lastError === "not_authenticated"
-                  ? "The CLI is installed but not signed in. Open Setup help for the login command."
+                  ? `CLI đã cài nhưng chưa đăng nhập. Chạy \`${loginCommandOf(pending)}\` rồi bấm "Kiểm tra lại".`
                   : "Install the CLI from npm and sign in. Open Setup help for the exact commands."}
               </div>
               <button
@@ -325,6 +363,17 @@ export function AiProvidersSection() {
               >
                 Setup help →
               </button>
+              <button
+                type="button"
+                className="selection-panel__setup-btn"
+                onClick={() => void recheck()}
+                disabled={rechecking}
+              >
+                {rechecking ? "Đang kiểm tra…" : "Kiểm tra lại"}
+              </button>
+              {API_KEY_PROVIDERS.has(pending) && (
+                <ApiKeyRow provider={pending} onSaved={refresh} />
+              )}
             </div>
           ) : (
             // Ready branch: provider is connected. Show ONE connection
@@ -338,6 +387,40 @@ export function AiProvidersSection() {
               <div className="selection-panel__heading">
                 Test the connection, then Apply
               </div>
+              {/* A CLI signed in with an API key is "available" and
+                  "configured", so it lands in THIS branch, not the setup
+                  one — which is how a codex holding a key OpenAI rejects
+                  looked completely healthy. Say which identity is in play
+                  before the user spends two minutes on a test. */}
+              {pendingProvider.mode === "cli"
+                && pendingProvider.authMode === "apikey" && (
+                <div className="selection-panel__requirement">
+                  {labelOf(pending)} đang chạy bằng <strong>API key</strong>,
+                  không phải gói thuê bao. Muốn dùng OAuth thì chạy{" "}
+                  <code>{loginCommandOf(pending)}</code> rồi bấm{" "}
+                  <button
+                    type="button"
+                    className="selection-panel__inline-btn"
+                    onClick={() => void recheck()}
+                    disabled={rechecking}
+                  >
+                    {rechecking ? "đang kiểm tra…" : "Kiểm tra lại"}
+                  </button>
+                  .
+                </div>
+              )}
+              {/* The requirement used to live only in the Apply button's
+                  `title`. A native tooltip truncates at the window edge and
+                  needs a second of hover — one user sat in front of a
+                  disabled button reading "Run the connection test suc…" and
+                  concluded the app was broken. It is a rule, so it is
+                  written down. */}
+              {!testPassed && (
+                <div className="selection-panel__requirement">
+                  Bấm <strong>Test</strong> trước — nút Apply chỉ mở khi test
+                  xanh. Provider chạy qua CLI có thể mất tới 2 phút.
+                </div>
+              )}
               <ConnectionTestRow
                 providerLabel={labelOf(pending)}
                 result={test}
@@ -360,8 +443,10 @@ export function AiProvidersSection() {
                   {applying
                     ? "Applying…"
                     : selectionUnchanged
-                      ? "Already active"
-                      : "Apply changes"}
+                      ? "Đang dùng"
+                      : !testPassed
+                        ? "Cần test trước"
+                        : "Apply changes"}
                 </button>
               </div>
 
@@ -396,6 +481,24 @@ interface ConnectionTestRowProps {
  * 3-feature test list — one ping is sufficient because all 3 features
  * point at the same provider in single-provider mode. */
 function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowProps) {
+  // A CLI provider's ping is not instant — Claude measured between 18 and 38
+  // seconds on a warm machine, against a 120-second backend budget. Without
+  // a moving number that reads as a hang, and the user stops waiting before
+  // the answer arrives.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (result.state !== "testing") {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const id = setInterval(
+      () => setElapsed(Math.floor((Date.now() - started) / 1000)),
+      1000,
+    );
+    return () => clearInterval(id);
+  }, [result.state]);
+
   const icon =
     result.state === "ok"
       ? "✓"
@@ -410,7 +513,7 @@ function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowP
       : result.state === "fail" && result.error
         ? result.error
         : result.state === "testing"
-          ? "Pinging the CLI…"
+          ? `Đang gọi CLI… ${elapsed}s (có thể mất tới 2 phút)`
           : "Sends one tiny prompt to verify the CLI answers.";
   return (
     <div className={`feature-test-row feature-test-row--${result.state}`}>
@@ -438,12 +541,16 @@ function ConnectionTestRow({ providerLabel, result, onTest }: ConnectionTestRowP
       </div>
       <button
         type="button"
-        className="feature-test-row__btn"
+        className={
+          result.state === "ok"
+            ? "feature-test-row__btn"
+            : "feature-test-row__btn feature-test-row__btn--primary"
+        }
         onClick={onTest}
         disabled={result.state === "testing"}
       >
         {result.state === "testing"
-          ? "Testing…"
+          ? `Testing… ${elapsed}s`
           : result.state === "ok"
             ? "Re-test"
             : result.state === "fail"
@@ -502,6 +609,99 @@ function CliReference({ provider }: CliReferenceProps) {
       </a>
     </div>
   );
+}
+
+/** Paste-a-key setup, for providers whose REST mode makes that sufficient.
+ *
+ * The panel used to offer only CLI instructions, which is a dead end for
+ * anyone who cannot complete the CLI's browser OAuth — and since Google
+ * retired that login for individual Gemini accounts, that is now most people.
+ * The key never comes back from the server (`getLlmProviders` reports only
+ * `configured`), so this field is write-only by design and shows no value.
+ */
+function ApiKeyRow({
+  provider,
+  onSaved,
+}: {
+  provider: LLMProviderName;
+  onSaved(): void | Promise<void>;
+}) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  async function save() {
+    const key = value.trim();
+    if (!key) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await setLlmApiKey(provider, key);
+      // Drop it from component state immediately — no reason to keep a
+      // credential sitting in the DOM after it has been stored.
+      setValue("");
+      setSaved(true);
+      await onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the key.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="selection-panel__api-key">
+      <div className="selection-panel__setup-text">
+        Or paste an API key — no CLI, no browser login. Stored in{" "}
+        <code>~/.flowboard/secrets.json</code> (mode 600, local only).
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        <input
+          type="password"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setSaved(false);
+          }}
+          placeholder={`${labelOf(provider)} API key`}
+          autoComplete="off"
+          spellCheck={false}
+          style={{ flex: "1 1 240px", minWidth: 200 }}
+        />
+        <button
+          type="button"
+          className="selection-panel__setup-btn"
+          onClick={() => void save()}
+          disabled={busy || value.trim().length === 0}
+        >
+          {busy ? "Saving…" : "Save key"}
+        </button>
+      </div>
+      {saved && (
+        <div className="selection-panel__setup-text">
+          ✓ Saved. The card above flips to Connected on the next poll.
+        </div>
+      )}
+      {error && (
+        <div className="selection-panel__setup-text" role="alert">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The command that signs this provider's CLI in. */
+function loginCommandOf(name: LLMProviderName): string {
+  switch (name) {
+    case "claude":
+      return "claude auth login";
+    case "gemini":
+      return "gemini auth login";
+    case "openai":
+      return "codex login";
+  }
 }
 
 function labelOf(name: LLMProviderName): string {

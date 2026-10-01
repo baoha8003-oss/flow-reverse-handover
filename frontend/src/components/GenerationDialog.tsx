@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useGenerationStore } from "../store/generation";
 import { useBoardStore, type StoryboardGrid } from "../store/board";
+import { useLane, useModelsStore } from "../store/models";
 import {
   STORYBOARD_GRIDS,
   buildStoryboardPrompt,
@@ -10,17 +11,20 @@ import {
 } from "../lib/storyboardPrompt";
 import {
   useSettingsStore,
-  OMNI_FLASH_CREDIT_COST,
-  OMNI_FLASH_DURATIONS,
   type OmniFlashDuration,
   type VideoQuality,
 } from "../store/settings";
 import {
   autoPrompt as autoPromptApi,
   autoPromptBatch as autoPromptBatchApi,
+  autoPromptEnsemble as autoPromptEnsembleApi,
+  listVideoStyles,
   mediaUrl,
   patchEdge,
   patchNode,
+  relayPrompt as relayPromptApi,
+  type PromptFinding,
+  type VideoStyle,
 } from "../api/client";
 import {
   CHARACTER_GENDERS,
@@ -111,25 +115,11 @@ type CameraKey = (typeof CAMERA_MOVEMENTS)[number]["key"];
 // opening the gear menu. Selecting a chip mutates the global settings
 // store (same pattern as the Omni-duration chips below), so the choice
 // is sticky for subsequent dispatches.
-// Each chip is either a Veo quality combo or Omni Flash. `ultraOnly`
-// chips are locked when the detected paygate tier isn't TIER_TWO —
-// the backend would silently fall back to Fast otherwise.
-type VeoChip = {
-  kind: "veo";
-  quality: VideoQuality;
-  label: string;
-  ultraOnly: boolean;
-};
-type OmniChip = { kind: "omni"; label: string };
-type VideoModelChip = VeoChip | OmniChip;
-
-const VIDEO_MODEL_CHIPS: readonly VideoModelChip[] = [
-  { kind: "veo", quality: "lite", label: "Veo 3.1 Lite", ultraOnly: false },
-  { kind: "veo", quality: "fast", label: "Veo 3.1 Fast", ultraOnly: false },
-  { kind: "veo", quality: "quality", label: "Veo 3.1 Quality", ultraOnly: false },
-  { kind: "veo", quality: "lite_relaxed", label: "Veo 3.1 Lite (Low Priority)", ultraOnly: true },
-  { kind: "omni", label: "Omni Flash" },
-];
+// The video model list is NOT a constant here. Which Veo qualities exist
+// depends on the lane this node will dispatch on — start→end has `fast` and
+// nothing else — and on the account tier. Both live in /api/models, so the
+// picker below reads the lane rather than a literal with an `ultraOnly` flag
+// that only ever knew about one of the two reasons an option can be wrong.
 
 function cameraInstruction(key: CameraKey): string {
   return CAMERA_MOVEMENTS.find((c) => c.key === key)?.instruction ?? "";
@@ -237,6 +227,12 @@ export function GenerationDialog() {
   // Stored as a Set of indices so the UI can toggle individual variants
   // and "All / None" without juggling parallel arrays.
   const [selectedSourceIdx, setSelectedSourceIdx] = useState<Set<number>>(new Set());
+  // Optional destination frame for first→last interpolation. Null = plain i2v.
+  const [endMediaId, setEndMediaId] = useState<string | null>(null);
+  // Visual style preset appended to the auto-prompt system prompt. Empty =
+  // the synthesizer's built-in editorial look.
+  const [styleName, setStyleName] = useState<string>("");
+  const [styleOptions, setStyleOptions] = useState<VideoStyle[]>([]);
   // Tracks which Source-Reference chip's variant picker is currently
   // open. Holds the edge id the picker is anchored to (one open at a
   // time). Click another chip → swap; click the same chip → close;
@@ -259,14 +255,34 @@ export function GenerationDialog() {
   const videoQuality = useSettingsStore((s) => s.videoQuality);
   const setVideoModel = useSettingsStore((s) => s.setVideoModel);
   const setVideoQuality = useSettingsStore((s) => s.setVideoQuality);
+  const loadModels = useModelsStore((s) => s.load);
+  useEffect(() => {
+    void loadModels();
+  }, [loadModels]);
   const omniFlashDuration = useSettingsStore((s) => s.omniFlashDuration);
   const setOmniFlashDuration = useSettingsStore(
     (s) => s.setOmniFlashDuration,
   );
-  // Auto-detected paygate tier (PAYGATE_TIER_ONE / TIER_TWO). Used to
-  // lock the Ultra-only model chips (lite_relaxed) for Pro users — same
-  // gating as the SettingsPanel.
-  const paygateTier = useGenerationStore((s) => s.paygateTier);
+
+  // Which composer runs when the box is left empty. P3 built three and the
+  // dialog called one: `/auto/ensemble` had a client function nothing
+  // imported, and `/api/prompt/relay` had none at all.
+  const promptMode = node?.data.promptMode ?? "single";
+  // What the relay's own check found. Shown, not enforced: the relay hands
+  // back the prompt either way and the user is the one paying for the
+  // dispatch, so the decision is theirs.
+  const [promptNotes, setPromptNotes] = useState<PromptFinding[]>([]);
+
+  function setPromptMode(next: "single" | "ensemble" | "relay") {
+    // `rfId` is only narrowed below, by the early return that closes the
+    // dialog when nothing is open.
+    if (!rfId) return;
+    useBoardStore.getState().updateNodeData(rfId, { promptMode: next });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, { data: { promptMode: next } }).catch(() => {});
+    }
+  }
 
   const targetType = node?.data.type ?? "image";
   const isVideo = targetType === "video";
@@ -313,6 +329,36 @@ export function GenerationDialog() {
   const sourceMediaIds: string[] = isVideo
     ? (sourceNode?.data.mediaIds ?? (sourceMediaId ? [sourceMediaId] : []))
         .filter((m): m is string => typeof m === "string" && m.length > 0)
+    : [];
+
+  // Every rendered frame reachable from an upstream edge, flattened across
+  // variants — the pool the user picks a destination frame from. The start
+  // frame itself is filtered out at render time, since a clip cannot
+  // interpolate to the frame it already begins on.
+  const endFrameCandidates: { mediaId: string; label: string }[] = isVideo
+    ? edges
+        .filter((e) => e.target === rfId)
+        .flatMap((e) => {
+          const n = nodes.find((node) => node.id === e.source);
+          if (!n || !REF_SOURCE_TYPES.has(n.data.type)) return [];
+          const variants = (
+            Array.isArray(n.data.mediaIds)
+              ? n.data.mediaIds
+              : typeof n.data.mediaId === "string"
+                ? [n.data.mediaId]
+                : []
+          ).filter((m): m is string => typeof m === "string" && m.length > 0);
+          return variants.map((mediaId, i) => ({
+            mediaId,
+            label:
+              variants.length > 1
+                ? `#${n.data.shortId} v${i + 1}`
+                : `#${n.data.shortId}`,
+          }));
+        })
+        .filter(
+          (c, i, all) => all.findIndex((x) => x.mediaId === c.mediaId) === i,
+        )
     : [];
 
   // Image nodes: list every upstream ref edge feeding this target. We
@@ -457,6 +503,15 @@ export function GenerationDialog() {
         upstreamNode?.data.mediaIds ??
         (upstreamNode?.data.mediaId ? [upstreamNode.data.mediaId] : []);
       setSelectedSourceIdx(new Set(ups.map((_, i) => i)));
+      setEndMediaId(null);
+      // The style library lives on disk next to the agent; an empty list
+      // just means the packaged asset folder isn't there, which is not an
+      // error worth surfacing mid-generation.
+      if (styleOptions.length === 0) {
+        listVideoStyles()
+          .then(setStyleOptions)
+          .catch(() => setStyleOptions([]));
+      }
       triggerRef.current = document.activeElement;
       // Focus textarea on open
       setTimeout(() => firstFocusRef.current?.focus(), 50);
@@ -509,6 +564,30 @@ export function GenerationDialog() {
     document.addEventListener("mousedown", onPointerDown);
     return () => document.removeEventListener("mousedown", onPointerDown);
   }, [openVariantPicker]);
+
+  // The end frame must never equal the start frame. Which source IS the
+  // start frame depends on the current selection, so changing that selection
+  // can silently make the two the same id — the picker only excludes the
+  // start frame while rendering, and dispatch only checked that an end frame
+  // was set. Clear it whenever the selection stops supporting it.
+  const startFrameId =
+    selectedSourceIdx.size === 1
+      ? (sourceMediaIds[[...selectedSourceIdx][0]] ?? null)
+      : null;
+  useEffect(() => {
+    if (endMediaId !== null && (startFrameId === null || endMediaId === startFrameId)) {
+      setEndMediaId(null);
+    }
+  }, [endMediaId, startFrameId]);
+
+  // Which lane this node will actually dispatch on — the same three-way the
+  // backend makes. It matters because the lanes do not offer the same
+  // qualities: the first→last-frame key family exists for `fast` alone, so a
+  // start→end node offered "Quality" was offering a substitution.
+  const videoLane = useLane(
+    endMediaId ? "startEnd" : sourceMediaIds.length > 0 ? "i2v" : "t2v",
+  );
+  const omniLane = useLane("omni");
 
   // Focus trap
   useEffect(() => {
@@ -684,8 +763,44 @@ export function GenerationDialog() {
           // "display" prompt; full per-variant list goes through opts.
           finalPrompt = res.prompts[0] ?? "";
           setPrompt(res.prompts.join("\n\n— variant —\n\n"));
+        } else if (promptMode === "ensemble") {
+          const res = await autoPromptEnsembleApi({
+            node_id: dbId,
+            ...(isVideo ? { camera } : {}),
+            ...(styleName ? { style: styleName } : {}),
+          });
+          finalPrompt = res.prompt;
+          setPrompt(finalPrompt);
+        } else if (promptMode === "relay") {
+          // The relay works from a BRIEF, not from a node: it plans, writes,
+          // checks the rules for free and verifies the meaning. With the box
+          // empty the brief is the node's title plus whatever the upstream
+          // briefs say, which is what `/auto` reads too.
+          const brief = [node?.data.title, node?.data.aiBrief]
+            .filter((x): x is string => !!x && x.trim().length > 0)
+            .join(" — ");
+          // The cast is what makes `unknown_tag` worth checking: a `@@name`
+          // matching no wired character resolves to nothing at the generator.
+          const castNames = edges
+            .filter((e) => e.target === rfId)
+            .map((e) => nodes.find((n) => n.id === e.source))
+            .filter((n) => n?.data.type === "character")
+            .map((n) => n?.data.title)
+            .filter((t): t is string => !!t && t.trim().length > 0);
+          const res = await relayPromptApi({
+            brief: brief || (isVideo ? "một cảnh video" : "một khung hình"),
+            cast: castNames,
+            lane: isVideo ? videoQuality : null,
+            seconds: isVideo ? omniFlashDuration : null,
+          });
+          finalPrompt = res.prompt;
+          setPrompt(finalPrompt);
+          setPromptNotes(res.findings ?? []);
         } else {
-          const res = await autoPromptApi(dbId, isVideo ? { camera } : undefined);
+          const res = await autoPromptApi(dbId, {
+            ...(isVideo ? { camera } : {}),
+            ...(styleName ? { style: styleName } : {}),
+          });
           finalPrompt = res.prompt;
           setPrompt(finalPrompt);
         }
@@ -722,6 +837,7 @@ export function GenerationDialog() {
         kind: "video",
         sourceMediaId: useMulti ? undefined : picked[0],
         sourceMediaIds: useMulti ? picked : undefined,
+        endMediaId: !useMulti && endMediaId ? endMediaId : undefined,
         // Tell the node UI how many video tiles to reserve while pending —
         // otherwise it defaults to 1 placeholder even though we're
         // dispatching N i2v ops.
@@ -816,6 +932,37 @@ export function GenerationDialog() {
               </label>
               <span className="gen-dialog__char-count">{prompt.length}/500</span>
             </div>
+            <div className="image-engine" title="Cách viết prompt khi bạn để trống ô này">
+              {(
+                [
+                  ["single", "1 model", "Provider bạn đã pin viết một lần."],
+                  ["ensemble", "Nhiều model", "Mỗi provider viết một bản, một bản được chọn."],
+                  ["relay", "Relay 3 chặng", "Lên dàn ý → viết → kiểm luật miễn phí → soát nghĩa."],
+                ] as const
+              ).map(([key, label, hint]) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={`image-engine__opt${promptMode === key ? " is-active" : ""}`}
+                  title={hint}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPromptMode(key);
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {promptNotes.map((f, i) => (
+              <p
+                key={i}
+                className="gen-dialog__hint"
+                style={{ color: f.severity === "error" ? "var(--warn)" : undefined }}
+              >
+                ⚠ {f.message}
+              </p>
+            ))}
             <textarea
               id="gen-prompt"
               ref={firstFocusRef}
@@ -1026,6 +1173,103 @@ export function GenerationDialog() {
           </div>
         )}
 
+        {/* Visual style — steers auto-prompt only. Typing a prompt by hand
+            bypasses the synthesizer, so the preset has nothing to attach to. */}
+        {styleOptions.length > 0 && (
+          <div className="gen-dialog__field">
+            <div className="gen-dialog__label-row">
+              <span className="gen-dialog__label">Phong cách</span>
+            </div>
+            <select
+              className="gen-dialog__select"
+              value={styleName}
+              onChange={(e) => setStyleName(e.target.value)}
+            >
+              <option value="">Mặc định (không ép phong cách)</option>
+              {styleOptions.map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+            <p className="gen-dialog__hint">
+              Chỉ áp dụng khi để trống prompt để AI tự viết.
+            </p>
+          </div>
+        )}
+
+        {/* End frame — Veo first→last interpolation. Only offered on the
+            single-source path: one destination frame cannot serve a batch
+            of different start frames. */}
+        {isVideo && !isOmniVideo && selectedSourceIdx.size === 1 && (
+          <div className="gen-dialog__field">
+            <div className="gen-dialog__label-row">
+              <span className="gen-dialog__label">Ảnh cuối (tùy chọn)</span>
+              {endMediaId && (
+                <button
+                  type="button"
+                  className="source-select-mini"
+                  onClick={() => setEndMediaId(null)}
+                >
+                  Bỏ chọn
+                </button>
+              )}
+            </div>
+            {(() => {
+              const startId = sourceMediaIds[[...selectedSourceIdx][0]];
+              const options = endFrameCandidates.filter(
+                (c) => c.mediaId !== startId,
+              );
+              if (options.length === 0) {
+                return (
+                  <div className="source-image-row source-image-row--empty">
+                    Nối thêm một ảnh nữa vào node video để dùng ảnh đầu → ảnh
+                    cuối
+                  </div>
+                );
+              }
+              return (
+                <>
+                  <div className="source-image-row">
+                    {options.map((c) => {
+                      const checked = endMediaId === c.mediaId;
+                      return (
+                        <button
+                          key={c.mediaId}
+                          type="button"
+                          className={`source-thumb${checked ? " source-thumb--checked" : ""}`}
+                          onClick={() =>
+                            setEndMediaId(checked ? null : c.mediaId)
+                          }
+                          aria-pressed={checked}
+                          aria-label={`End frame ${c.label}${checked ? " selected" : ""}`}
+                        >
+                          <img
+                            className="source-image-row__thumb"
+                            src={mediaUrl(c.mediaId)}
+                            alt={c.label}
+                          />
+                          <span
+                            className="source-thumb__check"
+                            aria-hidden="true"
+                          >
+                            {checked ? "✓" : ""}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="gen-dialog__hint">
+                    {endMediaId
+                      ? "Video sẽ chuyển từ ảnh đầu sang ảnh cuối đã chọn."
+                      : "Không chọn thì chạy i2v thường (chỉ dùng ảnh đầu)."}
+                  </p>
+                </>
+              );
+            })()}
+          </div>
+        )}
+
         {/* Source references — image refs (character/image/visual_asset/
             Storyboard) AND prompt-text refs. Prompt nodes don't have
             media but their text feeds the auto-prompt synth, so we
@@ -1170,19 +1414,19 @@ export function GenerationDialog() {
               <InfoTip tip="Omni Flash dispatches via video:batchAsyncGenerateVideoReferenceImages with the upstream image(s) as IMAGE_USAGE_TYPE_ASSET refs. Duration scales credit cost: 4s=15, 6s=20, 8s=25, 10s=30." />
             </span>
             <div className="aspect-chip-row">
-              {OMNI_FLASH_DURATIONS.map((d) => {
-                const active = omniFlashDuration === d;
+              {omniLane.durations.map((d) => {
+                const active = omniFlashDuration === d.value;
                 return (
                   <button
-                    key={d}
+                    key={d.value}
                     type="button"
                     className={`aspect-chip${active ? " aspect-chip--active" : ""}`}
                     onClick={() =>
-                      setOmniFlashDuration(d as OmniFlashDuration)
+                      setOmniFlashDuration(d.value as OmniFlashDuration)
                     }
-                    title={`${d}s — ${OMNI_FLASH_CREDIT_COST[d]} credits`}
+                    title={`${d.label} — ${d.credits ?? "?"} credits`}
                   >
-                    {d}s · {OMNI_FLASH_CREDIT_COST[d]}c
+                    {d.label} · {d.credits ?? "?"}c
                   </button>
                 );
               })}
@@ -1220,27 +1464,19 @@ export function GenerationDialog() {
                 setVideoQuality(quality);
               }}
             >
-              {VIDEO_MODEL_CHIPS.map((m) => {
-                if (m.kind === "omni") {
-                  return (
-                    <option key="omni" value="omni">
-                      Omni Flash
-                    </option>
-                  );
-                }
-                const locked =
-                  m.ultraOnly && paygateTier !== "PAYGATE_TIER_TWO";
-                return (
-                  <option
-                    key={`veo:${m.quality}`}
-                    value={`veo:${m.quality}`}
-                    disabled={locked}
-                  >
-                    {m.label}
-                    {m.ultraOnly ? " · Ultra only" : ""}
-                  </option>
-                );
-              })}
+              {videoLane.qualities.map((q) => (
+                <option key={`veo:${q.value}`} value={`veo:${q.value}`}>
+                  {q.label}
+                  {/* A lane this account does not have still dispatches —
+                      substituted and billed. Say so in the option itself. */}
+                  {q.note ? " · sẽ bị thay thế" : ""}
+                </option>
+              ))}
+              {omniLane.qualities.map((q) => (
+                <option key="omni" value="omni">
+                  {q.label}
+                </option>
+              ))}
             </select>
           </div>
         )}

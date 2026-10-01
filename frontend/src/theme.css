@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+/* Design tokens for the NTA VEO3 replica shell, mined from the packaged
+   tool's screenshot. See docs/ui-spec.md for the source of every value.
+   Tailwind v4 reads these under @theme and generates matching utilities
+   (bg-bg, text-accent, etc.). The legacy canvas keeps its own styles.css
+   rules, which are unlayered and therefore win over Tailwind's preflight —
+   the two coexist until the canvas becomes the WORKFLOW tab. */
+@theme {
+  /* surfaces — near-black navy */
+  --color-bg: #0a0a14;
+  --color-surface: #10101f;
+  --color-card: #161628;
+  --color-sidebar: #0c0c18;
+  --color-elevated: #1c1c33;
+  --color-line: #232338;
+  --color-line-strong: #2f2f4a;
+
+  /* text */
+  --color-ink: #e6e8f0;
+  --color-ink-mute: #8b90a3;
+  --color-ink-dim: #5f6478;
+
+  /* accents */
+  --color-accent: #22d3ee;
+  --color-accent-deep: #0891b2;
+  --color-grape: #7c3aed;
+  --color-grape-deep: #6d28d9;
+  --color-indigo: #4f46e5;
+  --color-primary: #2563eb;
+  --color-primary-hi: #1d4ed8;
+  --color-zalo: #0068ff;
+  --color-danger: #dc2626;
+  --color-danger-hi: #b91c1c;
+  --color-magenta: #db2777;
+  --color-ok: #22c55e;
+  --color-warn: #f59e0b;
+
+  /* radii */
+  --radius-ctl: 8px;
+  --radius-card: 12px;
+  --radius-icon: 10px;
+
+  /* shell metrics */
+  --spacing-sidebar: 232px;
+  --spacing-topbar: 52px;
+  --spacing-statusbar: 30px;
+
+  /* type — Segoe UI first so it reads native-Windows like the original */
+  --font-sans: "Segoe UI", Inter, system-ui, sans-serif;
+}
+
+/* Native <select> popups render dark on Windows Chrome with this set, which
+   is why the shell can use plain <select> instead of a JS dropdown lib. */
+:root {
+  color-scheme: dark;
+}

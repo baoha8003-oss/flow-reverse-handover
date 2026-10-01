@@ -3,8 +3,39 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData, type FlowNode } from "../store/board";
 import { useGenerationStore } from "../store/generation";
 import { mediaUrl, patchEdge, patchNode, uploadImage, uploadImageFromUrl } from "../api/client";
+import { errorLabel } from "../lib/errorLabels";
+import { nodeErrorView } from "../lib/nodeErrorLine";
+import {
+  createCharacterOnFlow,
+  fanOutBoard,
+  listCharacters,
+  narrationSegments,
+  previewFanOut,
+  rereadNarration,
+  saveCharacter,
+  type FlowCharacter,
+} from "../api/client";
+import {
+  hasHoles,
+  rereadNote,
+  segmentLabel,
+  type RereadPreview,
+} from "../lib/narrationReread";
+import {
+  WATERMARK_CORNERS,
+  watermarkCorner,
+  withWatermarkCorner,
+} from "../lib/watermarkFallback";
 import { requestAutoBrief } from "../api/autoBrief";
 import { useReferencesStore } from "../store/references";
+import { useAppConfigStore } from "../store/appConfig";
+import { useCanvasUiStore } from "../store/canvasUi";
+import { useClipOpsStore } from "../store/clipOps";
+import {
+  extendReadiness,
+  primarySlot,
+  upscaleReadiness,
+} from "../lib/clipOps";
 import {
   normaliseStoryboardGrid,
   resolveStoryboardLayout,
@@ -14,9 +45,20 @@ const ICON: Record<string, string> = {
   character: "◎",
   image: "▣",
   video: "▶",
+  motion_control: "🕺",
   prompt: "✦",
   note: "✎",
   visual_asset: "◇",
+  analyze_video: "◱",
+  merge_video: "⧉",
+  edit_video: "✂",
+  extract_last_frame: "⧗",
+  add_bgm: "♪",
+  create_voice: "🗣",
+  align_video_voice: "⇔",
+  sync_image_voice: "◉",
+  remove_watermark: "⌫",
+  review_video: "★",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -40,6 +82,60 @@ function StatusStrip({ status }: { status?: string }) {
 
 const ACCEPT_MIME = "image/png,image/jpeg,image/webp,image/gif";
 
+/** Which service draws this image node, when there is a choice.
+ *
+ * Hidden unless one of the OpenAI paths has been switched on in Settings —
+ * or the node already asks for OpenAI, which is the case that must stay
+ * visible: a board built elsewhere (or by the agent) can carry the setting
+ * on a machine where it is off, and the run will refuse. Showing the chip
+ * is how that becomes fixable instead of mysterious.
+ */
+function ImageEngineChip({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const config = useAppConfigStore((s) => s.values);
+  const offered =
+    config.OPENAI_IMAGE_ENABLED === true ||
+    config.OPENAI_IMAGE_RELAY_ENABLED === true;
+  const engine = data.imageEngine === "openai" ? "openai" : "flow";
+  if (!offered && engine === "flow") return null;
+
+  function pick(next: "flow" | "openai") {
+    if (next === engine) return;
+    useBoardStore.getState().updateNodeData(rfId, { imageEngine: next });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, { data: { imageEngine: next } }).catch(() => {});
+    }
+  }
+
+  return (
+    <div className="image-engine">
+      {(["flow", "openai"] as const).map((key) => (
+        <button
+          key={key}
+          type="button"
+          className={`image-engine__opt${engine === key ? " is-active" : ""}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            pick(key);
+          }}
+          title={
+            key === "flow"
+              ? "Google Flow vẽ ảnh này (mặc định, tốn credit Flow)"
+              : "OpenAI vẽ ảnh này (tốn tiền/quota OpenAI, không tốn credit Flow)"
+          }
+        >
+          {key === "flow" ? "Flow" : "OpenAI"}
+        </button>
+      ))}
+      {!offered && engine === "openai" && (
+        <span className="image-engine__warn" title="Bật trong Cài đặt → Tạo ảnh bằng OpenAI">
+          đang tắt
+        </span>
+      )}
+    </div>
+  );
+}
+
 function BriefHint({ data }: { data: FlowboardNodeData }) {
   if (data.autoPromptStatus === "pending") {
     return <p className="brief-hint brief-hint--pending">✨ Composing prompt…</p>;
@@ -62,6 +158,164 @@ function isLLMBusy(data: FlowboardNodeData): boolean {
   return (
     data.autoPromptStatus === "pending"
     || data.aiBriefStatus === "pending"
+  );
+}
+
+/** Which registered character this node IS.
+ *
+ * A character node used to be a picture with a title. The packaged tool's
+ * component mode sends `referenceEntities: [{entityId}]` — ids Flow issues in
+ * its own UI, per project — so a node needs a way to say which of those it
+ * stands for. Without this the entity path was reachable over HTTP and nowhere
+ * else, which is where audit items #3 and #13 had been sitting.
+ *
+ * Two ways to get one. `＋` CREATES the character on Flow and keeps the id it
+ * returns — one name, one click. `⌨` registers an id the user already made in
+ * Flow's own UI, which stays because it is still a valid way in (and the only
+ * one when Flow refuses the create), not as a leftover.
+ */
+function CharacterLink({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const boardId = useBoardStore((s) => s.boardId);
+  const [rows, setRows] = useState<FlowCharacter[]>([]);
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const linked = data.characterId ?? "";
+
+  useEffect(() => {
+    if (boardId === null) return;
+    let live = true;
+    listCharacters(boardId)
+      .then((list) => live && setRows(list))
+      // A board with no Flow project yet answers 409; that is not an error the
+      // card should shout about — it resolves on the first run.
+      .catch(() => live && setRows([]));
+    return () => {
+      live = false;
+    };
+  }, [boardId]);
+
+  function link(next: string) {
+    useBoardStore.getState().updateNodeData(rfId, { characterId: next || undefined });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      // `null`, not undefined: the backend merges `data`, and undefined is
+      // dropped by JSON.stringify — the old link would survive the merge.
+      patchNode(dbId, { data: { characterId: next || null } }).catch(() => {});
+    }
+  }
+
+  /** Store what came back and point this node at it. */
+  function adopt(saved: FlowCharacter) {
+    setRows((prev) => [...prev.filter((r) => r.id !== saved.id), saved]);
+    link(saved.id);
+    setNote(null);
+  }
+
+  /** Ask Flow to create the character, then register the id it returns.
+   *
+   * Guarded by `busy` because a second click would create a SECOND character on
+   * Flow under the same name — two entities, and the prompt tag `@@Name` can
+   * then only mean one of them. */
+  async function register() {
+    if (boardId === null || busy) return;
+    const name = window.prompt(
+      "Tên nhân vật (prompt sẽ tag bằng @@Tên, chỉ A-Z 0-9 _):",
+      data.title || "",
+    );
+    if (name === null || !name.trim()) return;
+    setBusy(true);
+    try {
+      adopt(
+        await createCharacterOnFlow(boardId, {
+          name: name.trim(),
+          mediaId: data.mediaId ?? "",
+        }),
+      );
+    } catch (e) {
+      // Keep the reason AND point at the way out. Flow refusing the create is
+      // not the end of the road: the character can still be made in Flow's UI
+      // and its id registered here.
+      const why = e instanceof Error ? e.message : "không tạo được";
+      setNote(`Flow từ chối tạo nhân vật: ${why} — tạo trong Flow rồi dán id bằng nút ⌨.`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Register a character the user already made in Flow — paste its id. */
+  async function registerByPaste() {
+    if (boardId === null || busy) return;
+    const name = window.prompt(
+      "Tên nhân vật (prompt sẽ tag bằng @@Tên, chỉ A-Z 0-9 _):",
+      data.title || "",
+    );
+    if (name === null || !name.trim()) return;
+    const entityId = window.prompt(
+      "Entity ID từ Flow (bỏ trống nếu chỉ dùng ảnh tham chiếu):",
+      "",
+    );
+    if (entityId === null) return;
+    setBusy(true);
+    try {
+      adopt(
+        await saveCharacter(boardId, {
+          name: name.trim(),
+          entityId: entityId.trim(),
+          mediaId: data.mediaId ?? "",
+        }),
+      );
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Không lưu được nhân vật.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const current = rows.find((r) => r.id === linked);
+
+  return (
+    <div className="character-link" onClick={(e) => e.stopPropagation()}>
+      <select
+        value={linked}
+        onChange={(e) => link(e.target.value)}
+        title="Nhân vật đã đăng ký trong project Flow của board này"
+      >
+        <option value="">— chỉ ảnh tham chiếu —</option>
+        {rows.map((row) => (
+          <option key={row.id} value={row.id}>
+            {row.name}
+            {row.entityId ? " · entity" : ""}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={() => void register()}
+        disabled={busy}
+        title="Tạo nhân vật mới trên Flow (không tốn credit)"
+      >
+        {busy ? "…" : "＋"}
+      </button>
+      <button
+        type="button"
+        onClick={() => void registerByPaste()}
+        disabled={busy}
+        title="Dán Entity ID của nhân vật đã tạo sẵn trong Flow"
+      >
+        ⌨
+      </button>
+      {current && !current.usable && (
+        <p className="character-link__warn" role="alert">
+          Entity này thuộc project khác — chạy sẽ bị từ chối. Tạo lại trong đúng
+          project Flow rồi dán lại id.
+        </p>
+      )}
+      {note && (
+        <p className="character-link__warn" role="alert">
+          {note}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -178,6 +432,7 @@ function CharacterBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }
           {uploading && <span className="character-drop__overlay">…</span>}
         </div>
         <BriefHint data={data} />
+        <CharacterLink rfId={rfId} data={data} />
         <button
           type="button"
           className="visual-asset__action"
@@ -333,6 +588,7 @@ function ImageTile({
 }) {
   const [attempt, setAttempt] = useState(0);
   const [loaded, setLoaded] = useState(false);
+  const previewsHidden = useCanvasUiStore((s) => s.previewsHidden);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -353,6 +609,30 @@ function ImageTile({
         aria-hidden="true"
       >
         <span className="thumbnail-tile__icon">▣</span>
+      </div>
+    );
+  }
+
+  // Previews hidden: the tile still says there IS a result, and stays
+  // clickable so the viewer is one click away. Rendering nothing would be
+  // indistinguishable from an empty node, which is the opposite of true.
+  if (previewsHidden) {
+    return (
+      <div
+        className="thumbnail-tile thumbnail-tile--hidden"
+        role={onClick ? "button" : undefined}
+        tabIndex={onClick ? 0 : undefined}
+        title="Preview đang tắt — bấm để mở kết quả"
+        onClick={onClick}
+        onKeyDown={(e) => {
+          if (!onClick) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick();
+          }
+        }}
+      >
+        <span className="thumbnail-tile__icon">✓</span>
       </div>
     );
   }
@@ -703,6 +983,7 @@ function ImageBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
             </>
           )}
         </div>
+        <ImageEngineChip rfId={rfId} data={data} />
         <BriefHint data={data} />
         {hiddenFileInput}
         {error && <p className="character-drop__error" role="alert">{error}</p>}
@@ -787,6 +1068,7 @@ function ImageBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
           onCancel={() => setPicker(null)}
         />
       )}
+      <ImageEngineChip rfId={rfId} data={data} />
       <BriefHint data={data} />
       {hiddenFileInput}
       {error && <p className="character-drop__error" role="alert">{error}</p>}
@@ -958,6 +1240,95 @@ function VideoTile({
   );
 }
 
+/** Upscale and extend, on a clip that already rendered.
+ *
+ * Both act on something the user already paid for, so the card is careful about
+ * two things. The upscale lands on its OWN key — the original stays, because a
+ * "make this better" button that replaces it is a loss with no undo. And an
+ * operation this clip cannot support shows as a DISABLED button carrying the
+ * reason, not as a missing one: "the button is not there" teaches nothing, while
+ * "Flow only extends Veo clips" is the answer.
+ *
+ * Neither price is known. This build has never measured 1080p upscale or the
+ * extension lanes, and the community capture that reported "0 credit" for the
+ * free lane measured it on someone else's account. So the card says so instead
+ * of implying free — the first real run is what measures it.
+ */
+function ClipOpsBar({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const running = useClipOpsStore((s) => s.running[rfId]);
+  const note = useClipOpsStore((s) => s.notes[rfId]);
+  const [paidLane, setPaidLane] = useState(false);
+
+  // Nothing rendered yet: these operations have no subject.
+  if (primarySlot(data) < 0) return null;
+
+  const up = upscaleReadiness(data);
+  const ext = extendReadiness(data);
+  const busy = Boolean(running);
+  const chain = data.extensionMediaIds ?? [];
+
+  async function onExtend() {
+    const prompt = window.prompt("Đoạn tiếp diễn ra thế nào?", data.prompt ?? "");
+    if (prompt === null || !prompt.trim()) return;
+    if (paidLane && !window.confirm(
+      "Làn trả phí: Flow sẽ tính credit cho lần nối này. Tiếp tục?",
+    )) {
+      return;
+    }
+    await useClipOpsStore.getState().extendClip(rfId, prompt.trim(), { paidLane });
+  }
+
+  return (
+    <div className="clip-ops" onClick={(e) => e.stopPropagation()}>
+      <div className="clip-ops__row">
+        <button
+          type="button"
+          disabled={busy || !up.ok}
+          title={up.ok ? "Nâng lên 1080p — chưa đo được giá" : up.reason}
+          onClick={() => void useClipOpsStore.getState().upscaleClip(rfId)}
+        >
+          {running?.kind === "upscale" ? "Đang nâng cấp…" : "⬆ 1080p"}
+        </button>
+        <button
+          type="button"
+          disabled={busy || !ext.ok}
+          title={
+            ext.ok
+              ? `Nối thêm một đoạn (đoạn thứ ${ext.position}) — chưa đo được giá`
+              : ext.reason
+          }
+          onClick={() => void onExtend()}
+        >
+          {running?.kind === "extend" ? "Đang nối…" : "⏵ Nối tiếp"}
+        </button>
+        <label className="clip-ops__lane" title="Mặc định dùng làn miễn phí">
+          <input
+            type="checkbox"
+            checked={paidLane}
+            disabled={busy}
+            onChange={(e) => setPaidLane(e.target.checked)}
+          />
+          trả phí
+        </label>
+      </div>
+      {data.upscaledMediaId && (
+        <p className="clip-ops__out">Đã có bản 1080p (giữ cả bản gốc).</p>
+      )}
+      {chain.length > 0 && (
+        <p className="clip-ops__out">
+          {chain.length} đoạn nối — ghép lại bằng node “Ghép video”.
+        </p>
+      )}
+      {note && (
+        <p className="clip-ops__note" role="status">
+          {note}
+        </p>
+      )}
+    </div>
+  );
+}
+
+
 function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
   const tileCount = tileCountFor(data);
   const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
@@ -1022,15 +1393,38 @@ function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       <div className={`video-grid video-grid--${tileCount}`}>
         {tiles}
       </div>
-      {(isError || isPartial) && data.error && (
-        <p
-          className={`node-error${isPartial ? " node-error--partial" : ""}`}
-          role={isError ? "alert" : "status"}
-        >
-          {data.error}
-        </p>
-      )}
+      <ReviewLoopToggle rfId={rfId} data={data} />
+      <ClipOpsBar rfId={rfId} data={data} />
     </div>
+  );
+}
+
+
+/** Why this node failed — on every kind of node.
+ *
+ * This lived inside `VideoBody` and nowhere else, so an image, character,
+ * storyboard, upload or post-production node that failed showed the red status
+ * strip with no text on it. The worst case is a refusal whose whole purpose is to
+ * say what to change: set an image node to OpenAI, leave a reference image wired,
+ * press ▶, and the only explanation appeared in a toast that dismisses itself on
+ * a timer.
+ */
+function NodeErrorLine({ data }: { data: FlowboardNodeData }) {
+  // The rule lives in `lib/nodeErrorLine` so it can be tested: this suite runs in
+  // node with no DOM, so a card-only rule is a rule nothing checks — which is how
+  // this stayed video-only for as long as it did.
+  const view = nodeErrorView(data);
+  if (!view) return null;
+  return (
+    <p
+      className={`node-error${view.isError ? "" : " node-error--partial"}`}
+      role={view.isError ? "alert" : "status"}
+      // The code stays in the tooltip: it is what a search, a log line and a bug
+      // report all match on.
+      title={view.code}
+    >
+      {errorLabel(view.code)}
+    </p>
   );
 }
 
@@ -1416,11 +1810,70 @@ function EditableTextBody({
       title="Double-click to edit"
     >
       {variant === "prompt" ? (
-        <pre className="prompt-text">{text || placeholder}</pre>
+        <>
+          <pre className="prompt-text">{text || placeholder}</pre>
+          <FanOutButton rfId={rfId} text={text} />
+        </>
       ) : (
         <p className="note-text">{text || placeholder}</p>
       )}
     </div>
+  );
+}
+
+/** Give each line of this prompt its own generation node.
+ *
+ * `fan_out` has been a service and an HTTP route since P7 with nothing calling
+ * it: the packaged tool's `prompt_list` node is how a five-scene script becomes
+ * five clips, and on this canvas the only way to reach it was curl.
+ *
+ * Deliberately NOT part of running the board. Fanning out during a run would
+ * make the cost dialog quote three dispatches and then spend twenty — the
+ * count has to be visible before the board changes, which is what the confirm
+ * below is for.
+ */
+function FanOutButton({ rfId, text }: { rfId: string; text: string }) {
+  const [busy, setBusy] = useState(false);
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const boardId = useBoardStore((s) => s.boardId);
+  if (lines.length < 2 || boardId === null) return null;
+
+  const dbId = parseInt(rfId, 10);
+  if (isNaN(dbId)) return null;
+
+  async function run(e: React.MouseEvent) {
+    e.stopPropagation();
+    setBusy(true);
+    try {
+      const preview = await previewFanOut(boardId!, dbId);
+      const message =
+        `${preview.lines} dòng → tạo ${preview.willCreate} node mới` +
+        (preview.willUpdate > 0 ? `, cập nhật ${preview.willUpdate}` : "") +
+        (preview.willDelete > 0 ? `, xoá ${preview.willDelete}` : "") +
+        ". Chưa chạy gì, chưa tốn credit. Tiếp tục?";
+      if (!window.confirm(message)) return;
+      await fanOutBoard(boardId!, dbId);
+      await useBoardStore.getState().refreshBoardState();
+    } catch {
+      // The board is unchanged on failure; the next press says so again.
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="prompt-fanout"
+      disabled={busy}
+      title="Mỗi dòng thành một node sinh riêng (bấm lại thì cập nhật, không nhân đôi)"
+      onClick={(e) => void run(e)}
+    >
+      ⑃ Tách {lines.length} dòng
+    </button>
   );
 }
 
@@ -1453,7 +1906,229 @@ function StoryboardBody({ rfId, data }: { rfId: string; data: FlowboardNodeData 
   );
 }
 
+/** Settings worth showing on the face of a post-production card, in the
+ *  order they matter. Everything else stays in `sourceSettings` — a card
+ *  that lists forty ffmpeg flags is a wall, not a summary. */
+const POSTPROD_SUMMARY_KEYS: [string, string][] = [
+  ["engine", "Engine"],
+  ["voice", "Giọng"],
+  ["gemini_model", "Model"],
+  ["analysis_mode", "Chế độ"],
+  ["style", "Phong cách"],
+  ["upscale_resolution", "Upscale"],
+  ["video_speed", "Tốc độ"],
+  ["effect", "Hiệu ứng"],
+  ["zoom_speed", "Tốc độ zoom"],
+  ["aspect_ratio", "Tỉ lệ"],
+  ["enable_sub", "Phụ đề"],
+  ["enable_bgm", "Nhạc nền"],
+  ["bgm_volume", "Âm lượng nhạc"],
+  ["mute_original_audio", "Tắt tiếng gốc"],
+];
+
+/** The only editable thing on a post-production card: where the CPU
+ *  watermark pass paints when the detector declines or cannot run. The box
+ *  arrived only inside imported workflow files until now, so the fallback was
+ *  reachable over HTTP and nowhere else. */
+function WatermarkFallback({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const settings = data.sourceSettings ?? {};
+
+  function pick(key: string) {
+    const next = withWatermarkCorner(settings, key);
+    useBoardStore.getState().updateNodeData(rfId, { sourceSettings: next });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, { data: { sourceSettings: next } }).catch(() => {});
+    }
+  }
+
+  return (
+    <label
+      className="postprod-pick"
+      title="Máy dò của bộ công cụ chạy trước. Khi nó không thấy gì hoặc không chạy được, MI-GAN (CPU) xoá đúng vùng góc này."
+      onClick={(e) => e.stopPropagation()}
+    >
+      <span>Vùng dự phòng</span>
+      <select
+        value={watermarkCorner(settings)}
+        onChange={(e) => pick(e.target.value)}
+      >
+        {WATERMARK_CORNERS.map((c) => (
+          <option key={c.key} value={c.key}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/** The switch for the clip-review loop, on the node that produces the clip.
+ *
+ * `review_loop.settings_from` has read this off `merged_settings` all along and
+ * the key was not in that function's allow-list, so the loop was off for every
+ * node unconditionally and nothing in the app could turn it on — which also made
+ * `estimate.reviewJobs` always count zero.
+ *
+ * Written into `sourceSettings` rather than onto `data`, because that is the
+ * shape `merged_settings` reads first and the one an exported template carries.
+ */
+function ReviewLoopToggle({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const settings = data.sourceSettings ?? {};
+  const on = Boolean(settings["review_loop"]);
+
+  function toggle(next: boolean) {
+    const merged = { ...settings, review_loop: next };
+    useBoardStore.getState().updateNodeData(rfId, { sourceSettings: merged });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, { data: { sourceSettings: merged } }).catch(() => {});
+    }
+  }
+
+  return (
+    <label
+      className="postprod-pick"
+      title={
+        "Sau khi clip xong, chấm điểm bằng AI rồi tự sinh lại nếu chưa đạt. "
+        + "Mỗi lượt chấm tốn quota AI của bạn, và mỗi lần sinh lại tốn credit "
+        + "Flow — trừ khi làn đang chạy là làn 0 credit. Hộp thoại Chạy hiện số "
+        + "lượt chấm trước khi bắt đầu."
+      }
+      onClick={(e) => e.stopPropagation()}
+    >
+      <span>Tự chấm &amp; sửa clip</span>
+      <input
+        type="checkbox"
+        checked={on}
+        onChange={(e) => toggle(e.target.checked)}
+      />
+    </label>
+  );
+}
+
+/** Read the failed narration segments again — the finished ones stay bought.
+ *
+ * Only on a `create_voice` node, and only once one has run: the control asks the
+ * backend which segments are holes, and there is nothing to ask about before the
+ * first read. The preview is fetched rather than derived here because the answer
+ * depends on a record on disk that only the agent can see.
+ *
+ * The button says what it will spend BEFORE it spends it. That is the whole point
+ * — the capability it restores is "one failed segment costs one segment", and a
+ * user cannot tell that from a button labelled "retry".
+ */
+function NarrationReread({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const boardId = useBoardStore((s) => s.boardId);
+  const [preview, setPreview] = useState<RereadPreview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const dbId = parseInt(rfId, 10);
+
+  // Only worth asking once the node has read something. `narrate_failed_segments`
+  // is the error the op leaves when it left holes, and `mediaId` covers the case
+  // where an earlier attempt finished — a later edit can still leave holes.
+  const ranBefore =
+    Boolean(data.mediaId) || Boolean(data.error?.startsWith("narrate_failed_segments"));
+
+  useEffect(() => {
+    if (boardId === null || isNaN(dbId) || !ranBefore) return;
+    let live = true;
+    narrationSegments(boardId, dbId)
+      .then((p) => live && setPreview(p))
+      // A 409 here is the ordinary case: nothing to re-read, no record, script
+      // changed. The control simply does not appear, which is the honest answer.
+      .catch(() => live && setPreview(null));
+    return () => {
+      live = false;
+    };
+  }, [boardId, dbId, ranBefore, data.error, data.mediaId]);
+
+  if (!hasHoles(preview) || preview === null) return null;
+
+  async function run() {
+    if (boardId === null || busy) return;
+    setBusy(true);
+    setNote(null);
+    try {
+      const out = await rereadNarration(boardId, dbId);
+      setNote(`Đã đọc lại ${out.reread.length} đoạn, giữ ${out.kept} đoạn.`);
+      setPreview(null);
+      await useBoardStore.getState().refreshBoardState();
+    } catch (e) {
+      setNote(e instanceof Error ? errorLabel(e.message) : "Không đọc lại được.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="narration-reread" onClick={(e) => e.stopPropagation()}>
+      <p className="narration-reread__note">{rereadNote(preview)}</p>
+      <ul className="narration-reread__rows">
+        {preview.segments.slice(0, 8).map((seg) => (
+          <li key={seg.index} title={seg.preview}>
+            {segmentLabel(seg)}
+          </li>
+        ))}
+      </ul>
+      <button type="button" disabled={busy} onClick={() => void run()}>
+        {busy ? "Đang đọc lại…" : `Đọc lại ${preview.read.length} đoạn lỗi`}
+      </button>
+      {note && <p className="narration-reread__msg">{note}</p>}
+    </div>
+  );
+}
+
+
+function PostprodBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const settings = data.sourceSettings ?? {};
+  const rows = POSTPROD_SUMMARY_KEYS.filter(([k]) => {
+    const v = settings[k];
+    return v !== undefined && v !== null && v !== "";
+  }).slice(0, 5);
+
+  return (
+    <div className="postprod-body">
+      {data.mediaId && (
+        <div className="postprod-out">✓ đã có kết quả</div>
+      )}
+      {data.type === "remove_watermark" && (
+        <WatermarkFallback rfId={rfId} data={data} />
+      )}
+      {data.type === "create_voice" && (
+        <NarrationReread rfId={rfId} data={data} />
+      )}
+      {rows.length === 0 ? (
+        <div className="postprod-empty">
+          Chưa cấu hình — nối video vào rồi bấm chạy.
+        </div>
+      ) : (
+        <dl className="postprod-settings">
+          {rows.map(([key, label]) => (
+            <div key={key}>
+              <dt>{label}</dt>
+              <dd>{String(settings[key])}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  );
+}
+
 function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  return (
+    <>
+      {bodyFor(rfId, data)}
+      {/* One place, because every type passes through here. `note` is excluded:
+          it never dispatches, so it has no failure of its own to report. */}
+      {data.type !== "note" && <NodeErrorLine data={data} />}
+    </>
+  );
+}
+
+function bodyFor(rfId: string, data: FlowboardNodeData) {
   switch (data.type) {
     case "character":
       return <CharacterBody rfId={rfId} data={data} />;
@@ -1469,6 +2144,11 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <VisualAssetBody rfId={rfId} data={data} />;
     case "Storyboard":
       return <StoryboardBody rfId={rfId} data={data} />;
+    default:
+      // Post-production nodes. They carry settings, not a prompt, so the
+      // card shows what the step is configured to do rather than an empty
+      // preview frame.
+      return <PostprodBody rfId={rfId} data={data} />;
   }
 }
 

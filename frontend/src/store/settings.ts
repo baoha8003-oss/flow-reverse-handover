@@ -9,26 +9,35 @@ import { create } from "zustand";
  * pick once in the dashboard Settings panel; every gen_image / edit_image
  * dispatch reads the cached preference and forwards it to the worker.
  *
- * Video model is currently derived from paygate tier + aspect (resolved
- * server-side via VIDEO_MODEL_KEYS), so it's a *display* on the panel
- * rather than a switchable preference. When/if Flow ships variants per
- * tier (e.g. fast vs quality) we extend this store with `videoModelKey`.
+ * The video lane is NOT a display. `dispatchGeneration` reads `videoQuality`
+ * from here for every canvas dispatch, so whatever this store holds is the lane
+ * that gets billed. The old comment here described a server-resolved
+ * `[tier][quality][aspect]` lookup that no longer exists: the batch transport
+ * sends no tier, and aspect became its own payload slot.
  */
-export type ImageModelKey = "NANO_BANANA_PRO" | "NANO_BANANA_2";
-// Veo 3.1 ships in four flavours:
-//   - Lite (smaller checkpoint, fastest, lower fidelity)
-//   - Fast (default — bigger model, balanced)
-//   - Quality (highest fidelity, slowest)
-//   - Lite Relaxed (Lite on a low-priority queue, 0 credits — Ultra only)
-// Choice applies globally across both portrait and landscape; backend
-// resolves the actual model key at dispatch time from [tier][quality][aspect].
-// Tier 1 (Pro) users picking `lite_relaxed` fall back to Fast on the
-// backend (and the Settings UI locks that radio for them).
+export type ImageModelKey =
+  | "NANO_BANANA_PRO"
+  | "NANO_BANANA_2"
+  | "NANO_BANANA_2_LITE";
+// The lanes this transport actually has a key for, plus OMNI.
+//
+//   - lite         Veo 3.1 Lite
+//   - fast         Veo 3.1 Fast — the priciest key on this path
+//   - lite_relaxed Lite on the low-priority queue (0 credit where the plan has it)
+//   - omni         OMNI Flash: the ONLY family serving text-to-video,
+//                  first→last and references on this transport
+//
+// `quality` is deliberately absent: it has no entry in `BATCH_VIDEO_LANES`, so
+// offering it could only produce a refusal while reading like a working lane.
+// The removed comment also promised that Pro users picking `lite_relaxed` "fall
+// back to Fast on the backend" — that substitution is exactly what this build
+// exists to avoid, and `routes/models.py` records that the promise must not be
+// shown again.
 export type VideoQuality =
   | "fast"
   | "lite"
-  | "quality"
-  | "lite_relaxed";
+  | "lite_relaxed"
+  | "omni";
 
 // Video model family. "veo" = the existing Veo 3.1 i2v family controlled
 // by videoQuality (lite/fast/quality/...). "omni_flash" = the new
@@ -37,17 +46,11 @@ export type VideoQuality =
 // GenerationDialog. The video dispatch path branches on this.
 export type VideoModelFamily = "veo" | "omni_flash";
 
-// Omni Flash duration → credit cost (informational, surfaced in the
-// dialog so the user sees the cost before submit). Mirrors the backend
-// OMNI_FLASH_CREDIT_COST table — pin both via tests.
-export const OMNI_FLASH_CREDIT_COST: Record<4 | 6 | 8 | 10, number> = {
-  4: 15,
-  6: 20,
-  8: 25,
-  10: 30,
-};
+// The lengths Omni Flash accepts. Their credit prices used to be mirrored
+// here as a literal; they now come from /api/models, because a stale copy
+// would quote a cost the account never gets charged. The type stays: it is
+// what the persisted preference is validated against.
 export type OmniFlashDuration = 4 | 6 | 8 | 10;
-export const OMNI_FLASH_DURATIONS: OmniFlashDuration[] = [4, 6, 8, 10];
 
 interface SettingsState {
   imageModel: ImageModelKey;
@@ -90,14 +93,33 @@ function persist(state: PersistShape): void {
 
 const persisted = loadPersisted();
 
-const VALID_VIDEO_QUALITIES: VideoQuality[] = ["fast", "lite", "quality", "lite_relaxed"];
+export const VALID_VIDEO_QUALITIES: VideoQuality[] = [
+  "lite",
+  "fast",
+  "lite_relaxed",
+  "omni",
+];
+
+export const VALID_IMAGE_MODELS: ImageModelKey[] = [
+  "NANO_BANANA_PRO",
+  "NANO_BANANA_2",
+  "NANO_BANANA_2_LITE",
+];
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
-  imageModel: persisted.imageModel ?? "NANO_BANANA_2",
+  imageModel:
+    persisted.imageModel && VALID_IMAGE_MODELS.includes(persisted.imageModel)
+      ? persisted.imageModel
+      : "NANO_BANANA_2",
+  // `lite`, matching `flow_sdk.DEFAULT_VIDEO_QUALITY` and its reason: "a board
+  // that never chose should not be charged the most for it". This defaulted to
+  // `fast` — the priciest key on this path — and because the store always sends
+  // a value the backend's own default was never reached, so every canvas
+  // image-to-video dispatch from an unconfigured install went to it.
   videoQuality:
     persisted.videoQuality && VALID_VIDEO_QUALITIES.includes(persisted.videoQuality)
       ? persisted.videoQuality
-      : "fast",
+      : "lite",
   videoModel: persisted.videoModel ?? "veo",
   omniFlashDuration: persisted.omniFlashDuration ?? 4,
   setImageModel(model) {

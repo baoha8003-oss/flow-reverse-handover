@@ -3,6 +3,14 @@ import { getLlmConfig } from "../api/client";
 import { AiProviderDialog } from "./AiProviderDialog";
 
 /**
+ * NOT MOUNTED. Kept for reference; `App.tsx` deliberately does not render
+ * this any more. It was written when the app was only a canvas, where every
+ * action ran through an LLM. The generation tabs use no LLM, so an
+ * undismissable boot dialog locked the user out of the whole tool over a
+ * dependency their task never needed — which is exactly what happened when
+ * the CLI it defaulted to could not sign in. If a gate comes back, it
+ * belongs on the feature that needs a provider, not on app start.
+ *
  * App-level gate that force-opens the AI Provider dialog whenever the
  * backend reports `configured=false`. The user can't dismiss this
  * dialog — it stays mounted until /config flips to configured (i.e.

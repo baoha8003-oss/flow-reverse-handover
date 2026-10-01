@@ -28,21 +28,49 @@ interface ProviderCardProps {
 
 const PROVIDER_META: Record<
   LLMProviderName,
-  { name: string; tagline: string }
+  { name: string; vendor: string }
 > = {
-  claude:  { name: "Claude Code",   tagline: "Anthropic CLI · OAuth" },
-  gemini:  { name: "Gemini CLI",    tagline: "Google CLI · OAuth" },
-  openai:  { name: "OpenAI Codex",  tagline: "ChatGPT CLI · OAuth" },
+  claude:  { name: "Claude Code",   vendor: "Anthropic CLI" },
+  gemini:  { name: "Gemini",        vendor: "Google" },
+  openai:  { name: "OpenAI Codex",  vendor: "ChatGPT CLI" },
 };
 
+/**
+ * The second line of the card: vendor + the identity actually in use.
+ *
+ * This used to be a fixed string per provider — claude "· OAuth", openai
+ * "· API key". Those were true on the machine they were written on and
+ * became lies the moment anyone signed in differently. The whole point of
+ * the backend's `authMode` is that this line is now measured, so a user
+ * who runs `codex login` sees the card change.
+ */
+function taglineFor(p: LLMProviderInfo): string {
+  const vendor = PROVIDER_META[p.name].vendor;
+  switch (p.authMode) {
+    case "oauth":
+      return `${vendor} · OAuth`;
+    case "apikey":
+      return `${vendor} · API key`;
+    default:
+      return `${vendor} · not signed in`;
+  }
+}
+
+/**
+ * Order matters here. "Connected" used to be tested first, which meant an
+ * installed-but-signed-out CLI reported Connected and the "Not signed in"
+ * branch below could never be reached — `available` only ever proved that
+ * `--version` answers, which it does when signed out too.
+ */
 function statusLabel(p: LLMProviderInfo): string {
-  if (p.available && p.configured) return "Connected";
   if (p.lastError === "not_authenticated") return "Not signed in";
+  if (p.available && p.configured) return "Connected";
   if (p.requiresKey && !p.configured) return "API key needed";
   return "Setup needed";
 }
 
 function statusKind(p: LLMProviderInfo): "ok" | "warn" {
+  if (p.lastError === "not_authenticated") return "warn";
   return p.available && p.configured ? "ok" : "warn";
 }
 
@@ -61,7 +89,7 @@ export function ProviderCard({ provider, selected, current, onSelect }: Provider
     >
       <div className="provider-card__head">
         <span className="provider-card__name">{meta.name}</span>
-        <span className="provider-card__tagline">{meta.tagline}</span>
+        <span className="provider-card__tagline">{taglineFor(provider)}</span>
       </div>
       <div className="provider-card__foot">
         <span className={`provider-card__status provider-card__status--${kind}`}>
