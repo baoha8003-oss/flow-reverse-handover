@@ -1,0 +1,6 @@
+# Project-local override (see scout-block hook).
+# Agent dependencies live only in agent/.venv, so running pytest means naming
+# that interpreter on the command line. Un-ignore it here so tests can run in
+# this repo without relaxing the global baseline.
+# Intent: EXECUTE the interpreter — do not scan the tree for context.
+!.venv

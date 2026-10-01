@@ -63,13 +63,17 @@
 > 1. **Google Flow plan: `Pro` or `Ultra` only.** Veo 3.1 i2v + GEM_PIX_2
 >    are gated to paid tiers. The free tier and trial accounts cannot
 >    drive video generation, so Flowboard cannot work on them. Confirm
->    your plan at [labs.google/fx](https://labs.google/fx/tools/flow)
->    before installing.
-> 2. **Chrome extension is mandatory.** All generation requests are
->    proxied through `extension/` (Chrome MV3) so the agent can ride
->    your authenticated Flow session + reCAPTCHA token. Without the
->    extension loaded and connected to `labs.google/fx/tools/flow`, the
->    `▶ Generate` button does nothing.
+>    your plan at [flow.google.com](https://flow.google.com/) before
+>    installing. Flowboard cannot read your plan or your credit balance
+>    — Google stopped exposing either — so you pick it once in
+>    `Settings → Tài khoản Google Flow` and it is used as a price label.
+> 2. **Chrome extension is mandatory, and the Flow tab has to stay open.**
+>    Since Google's September 2026 migration, Flow signs every call inside
+>    the page: a session cookie plus a per-page CSRF token, neither of
+>    which ever reaches this app. So generation does not run *through* the
+>    extension, it runs **inside your signed-in tab**. No tab, no
+>    generation — the `▶ Generate` button does nothing, and there is no
+>    headless mode to fall back on.
 > 3. **One LLM CLI on `PATH` for auto-prompt / vision / planner.**
 >    Flowboard ships a swappable provider layer — pick one in
 >    `Settings → AI Providers`:
@@ -338,8 +342,8 @@ matching vocab from the system prompt.
         │                             ▼
         │                   ┌────────────────────┐
         └───── Google Flow  │  React + Vite      │
-              labs.google   │  ReactFlow canvas  │
-              (i2v / image) │  Zustand store     │
+            flow.google.com │  ReactFlow canvas  │
+         (signed in the tab) │  Zustand store     │
                             │  127.0.0.1:5173    │
                             └────────────────────┘
 ```
@@ -352,10 +356,12 @@ matching vocab from the system prompt.
   through the extension, and shells out to the configured LLM CLI
   (Claude / Gemini / Codex — see *AI Providers* below) for vision +
   auto-prompt + planner synthesis.
-- **Extension** — Chrome MV3. Lives on `labs.google/fx/tools/flow`,
-  intercepts Flow's API calls (multimodal-fetch in MAIN world for the
-  reCAPTCHA token), proxies them over a localhost WebSocket so the
-  agent never has to touch the browser cookie jar directly.
+- **Extension** — Chrome MV3. Lives on `flow.google.com`. It mints the
+  reCAPTCHA token and then **runs each Flow RPC inside the page**
+  (`executeScript` in the MAIN world), because the page's own cookie and
+  CSRF token are what sign it. The agent never touches the browser cookie
+  jar, and never holds a Google credential of any kind — there is none
+  left to hold.
 - **Storage** — local-only. SQLite for graph + history, a
   `storage/media/` folder for cached image / video bytes (lazy-fetched
   from Flow's signed CDN URLs and re-served from the agent so they
@@ -373,7 +379,7 @@ matching vocab from the system prompt.
 | **Node 20+** | Frontend dev server (Vite) |
 | **Chrome / Chromium** | **Mandatory** — hosts the MV3 extension that proxies every Google Flow API call. The agent has zero direct path to Flow without it. |
 | **One LLM CLI** on `PATH` | Vision describe + auto-prompt + planner. Pick one — defaults to **Claude Code** ([`@anthropic-ai/claude-code`](https://docs.claude.com/claude-code/install)); also supports **Gemini CLI** ([`@google/gemini-cli`](https://github.com/google-gemini/gemini-cli)) and **OpenAI Codex** ([`@openai/codex`](https://github.com/openai/codex), provider implemented but not yet smoke-tested). All use OAuth against your existing AI subscription — no API key needed. |
-| **Google Flow `Pro` or `Ultra` plan** at [`labs.google/fx/tools/flow`](https://labs.google/fx/tools/flow) | **Free tier and trial accounts will not work.** Veo 3.1 i2v + GEM_PIX_2 image gen are gated to paid plans. |
+| **Google Flow `Pro` or `Ultra` plan** at [`flow.google.com`](https://flow.google.com/) | **Free tier and trial accounts will not work.** Veo 3.1 i2v + GEM_PIX_2 image gen are gated to paid plans. |
 
 > **Windows:** Use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install). All commands assume a Unix shell.
 
@@ -404,9 +410,16 @@ cd flowboard
 
 1. Open `chrome://extensions/` → enable **Developer mode** (top-right).
 2. Click **Load unpacked** → pick the `extension/` folder in this repo.
-3. Open a tab to <https://labs.google/fx/tools/flow> and sign in.
-4. The extension's icon should turn coloured once it captures a fresh
-   Flow auth token (~5 s).
+3. Open a tab to <https://flow.google.com/>, sign in, and open a
+   project. **Leave that tab open** — every Flow call runs inside it.
+4. Click the extension icon: the **Flow tab** row should read ready. If it
+   does not, it names which of three things to fix — reload the extension,
+   open a Flow tab, or sign in on the tab you already have.
+
+   (There is no token to wait for any more. This step used to say the icon
+   would colour once a Flow auth token was captured; Google stopped issuing
+   one, and the age it displayed kept ticking for 206 hours while every
+   call failed.)
 
 ### Step 2 — start the agent
 
@@ -447,10 +460,13 @@ about 15 minutes of clicking.
 ```bash
 # Agent
 cd agent && .venv/bin/python -m pytest -q
-# 333 passed
+# 591 passed  (2 further failures are POSIX-only assertions that always
+#              fail on Windows: file mode 0600 and absolute-path form)
 
 # Frontend
-cd frontend && npx tsc -p . --noEmit && npx vite build
+cd frontend && npm run lint    # tsc -b --noEmit
+cd frontend && npm test        # vitest run
+cd frontend && npm run build
 ```
 
 ---
@@ -591,7 +607,9 @@ frontend/               Vite + React + ReactFlow
     api/                client.ts, autoBrief.ts
 
 extension/              Chrome MV3 (content script + injected MAIN)
-docs/                   Static assets (this README, screenshots, demo media)
+docs/                   spec.md (mechanism contract: auth, polling, model keys,
+                        settings), ui-spec.md (byte-exact UI labels), PLAN.md,
+                        plus static assets (screenshots, demo media)
 storage/                Local cache + SQLite (gitignored)
 ```
 
