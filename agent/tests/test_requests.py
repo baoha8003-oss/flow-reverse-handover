@@ -826,7 +826,7 @@ def test_recover_orphan_running_requests_marks_them_failed(client):
     touched = _recover_orphan_running_requests()
     assert touched == 2
 
-    rows = client.get("/api/requests").json() if False else None  # noqa: F841
+    rows = client.get("/api/requests").json() if False else None
     from sqlmodel import select as _select
     with get_session() as s:
         rows = s.exec(_select(Request)).all()
@@ -971,12 +971,26 @@ def test_omni_flash_credit_cost_table():
 
 
 def test_omni_flash_resolve_model():
-    from flowboard.services.flow_sdk import resolve_omni_flash_model
+    """One resolver for all four Omni modes, replacing the r2v-only table.
 
-    assert resolve_omni_flash_model(4) == "abra_r2v_4s"
-    assert resolve_omni_flash_model(6) == "abra_r2v_6s"
-    assert resolve_omni_flash_model(8) == "abra_r2v_8s"
-    assert resolve_omni_flash_model(10) == "abra_r2v_10s"
+    `resolve_omni_flash_model` mapped a duration to `abra_r2v_<N>s` and nothing
+    else. `omni_model_key` builds the keys for references, first frame,
+    first+last and text from the same duration, so the four cannot disagree
+    about what 6 seconds is called.
+    """
+    from flowboard.services.flow_sdk import omni_model_key
+
+    for d in (4, 6, 8, 10):
+        assert omni_model_key("references", d) == f"abra_r2v_{d}s"
+        assert omni_model_key("first_frame", d) == f"abra_i2v_{d}s"
+        assert omni_model_key("text", d) == f"abra_t2v_{d}s"
+        assert omni_model_key("first_last", d) == f"omni_flash_i2v_{d}s_first_last"
+    assert omni_model_key("references", 6, "360p") == "abra_r2v_6s_360p"
+
     import pytest as _pt
+    # A duration Omni does not have is refused, not rounded: the duration IS
+    # part of the key, so the nearest one bills a different clip length.
     with _pt.raises(ValueError, match="unsupported"):
-        resolve_omni_flash_model(5)
+        omni_model_key("references", 5)
+    with _pt.raises(ValueError):
+        omni_model_key("no_such_mode", 6)

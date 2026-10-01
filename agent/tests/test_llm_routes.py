@@ -95,13 +95,33 @@ def test_set_openai_api_key(client, tmp_secrets_path):
 
 
 def test_set_key_for_cli_only_provider_returns_400(client, tmp_secrets_path):
-    """Claude doesn't accept API keys — UI shouldn't post here, but backend
-    must reject if it does."""
+    """Claude is CLI-only here — the UI shouldn't post a key for it, but the
+    backend must reject one if it does."""
     resp = client.put("/api/llm/providers/claude", json={"apiKey": "xyz"})
     assert resp.status_code == 400
     assert "doesn't accept API keys" in resp.json()["detail"]
+
+
+def test_gemini_accepts_an_api_key(client, tmp_secrets_path):
+    """Gemini has a REST mode, so a pasted key must be accepted and stored.
+
+    It used to be refused alongside Claude, which left anyone who could not
+    finish the CLI's browser OAuth with no way to use the provider at all —
+    and Google has since retired that login for individual accounts, so the
+    CLI is not a route back in.
+    """
     resp = client.put("/api/llm/providers/gemini", json={"apiKey": "xyz"})
-    assert resp.status_code == 400
+    assert resp.status_code == 200, resp.text
+
+    from flowboard.services.llm import secrets
+
+    assert secrets.get_api_key("gemini") == "xyz"
+    # Clearing works the same way, so a user can take the key back out.
+    assert (
+        client.put("/api/llm/providers/gemini", json={"apiKey": None}).status_code
+        == 200
+    )
+    assert secrets.get_api_key("gemini") is None
 
 
 def test_set_key_for_unknown_provider_returns_404(client, tmp_secrets_path):

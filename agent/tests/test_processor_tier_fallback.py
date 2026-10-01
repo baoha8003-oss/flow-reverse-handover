@@ -2,13 +2,18 @@
 
 The handler reads tier from two sources in priority order:
   1. params["paygate_tier"] — stamped by the frontend at dispatch
-  2. flow_client.paygate_tier — resolved authoritatively via
-     /v1/credits when the extension captures a Bearer token
+  2. flow_client.paygate_tier — live if a pre-migration session resolved one,
+     otherwise the value the user picked in Settings
 
-If neither is set, the handler fails loud with `paygate_tier_unknown`
-rather than silently defaulting. The old default (PAYGATE_TIER_ONE)
-downgraded Ultra users to Pro and stamped the wrong tier into the DB,
-poisoning /api/auth/me for the rest of the session.
+**Missing is now an ordinary state, and dispatch proceeds.** It used to be a
+hard refusal (`paygate_tier_unknown`), which was right while the REST payload
+carried `userPaygateTier`: defaulting to TIER_ONE served Ultra users at the Pro
+checkpoint and stamped the wrong tier into the DB, poisoning /api/auth/me.
+Google's September 2026 migration removed that field from the wire, so there is
+nothing left to get wrong — and the tier can no longer resolve by itself, so
+refusing would mean an app that cannot generate anything until someone fills in
+a dropdown. What the tests below pin instead: no tier is NOT coerced to
+TIER_ONE, and an unknown tier never reaches the payload.
 """
 from __future__ import annotations
 
@@ -71,17 +76,13 @@ async def test_gen_image_falls_back_to_live_flow_client_tier():
 
 
 @pytest.mark.asyncio
-async def test_gen_image_fails_loud_when_no_tier_signal_anywhere():
-    """No caller-stamped tier, no live signal from extension → the
-    handler MUST refuse to dispatch with `paygate_tier_unknown`, NOT
-    silently fall back to PAYGATE_TIER_ONE.
+async def test_gen_image_dispatches_without_any_tier_signal():
+    """No caller-stamped tier, nothing in Settings → the handler still
+    dispatches, and passes tier=None rather than inventing PAYGATE_TIER_ONE.
 
-    Regression guard for the silent-Pro-downgrade bug. The original
-    code defaulted to TIER_ONE here, which:
-      1. served Ultra users at the Pro checkpoint without warning, and
-      2. stamped the wrong tier into request.params, polluting the DB
-         and feeding back through /api/auth/me as a permanent Pro
-         status until a fresh known-good gen overwrote it.
+    The silent-Pro-downgrade guard now lives in `_client_context`, which omits
+    the field entirely (see test_flow_sdk). Refusing here would strand every
+    generation behind a dropdown that nothing can fill automatically.
     """
     flow_client._paygate_tier = None
 
@@ -90,36 +91,35 @@ async def test_gen_image_fails_loud_when_no_tier_signal_anywhere():
             "media_ids": ["m"],
             "media_entries": [],
         })
-        result, err = await proc._handle_gen_image({
+        _result, err = await proc._handle_gen_image({
             "prompt": "x",
             "project_id": "8b62385c-4916-4abd-b01f-b28173d8eb04",
         })
-        assert err == "paygate_tier_unknown"
-        # SDK must NOT have been called — the worker bailed before dispatch.
-        m.return_value.gen_image.assert_not_called()
+        assert err is None
+        _args, kwargs = m.return_value.gen_image.call_args
+        assert kwargs["paygate_tier"] is None
 
 
 @pytest.mark.asyncio
-async def test_gen_video_fails_loud_when_no_tier_signal_anywhere():
-    """Same regression guard as above, gen_video path."""
+async def test_gen_video_dispatches_without_any_tier_signal():
+    """Same, gen_video path."""
     flow_client._paygate_tier = None
 
     with patch("flowboard.worker.processor.get_flow_sdk") as m:
-        m.return_value.gen_video = AsyncMock(return_value={
-            "operation_names": [],
-        })
-        result, err = await proc._handle_gen_video({
+        m.return_value.gen_video = AsyncMock(return_value={"error": "stop here"})
+        _result, err = await proc._handle_gen_video({
             "prompt": "x",
             "project_id": "8b62385c-4916-4abd-b01f-b28173d8eb04",
             "start_media_id": "src-1",
         })
-        assert err == "paygate_tier_unknown"
-        m.return_value.gen_video.assert_not_called()
+        assert err == "stop here"
+        _args, kwargs = m.return_value.gen_video.call_args
+        assert kwargs["paygate_tier"] is None
 
 
 @pytest.mark.asyncio
-async def test_edit_image_fails_loud_when_no_tier_signal_anywhere():
-    """Same regression guard, edit_image path."""
+async def test_edit_image_dispatches_without_any_tier_signal():
+    """Same, edit_image path."""
     flow_client._paygate_tier = None
 
     with patch("flowboard.worker.processor.get_flow_sdk") as m:
@@ -127,13 +127,27 @@ async def test_edit_image_fails_loud_when_no_tier_signal_anywhere():
             "media_ids": ["m"],
             "media_entries": [],
         })
-        result, err = await proc._handle_edit_image({
+        _result, err = await proc._handle_edit_image({
             "prompt": "make it pop",
             "project_id": "8b62385c-4916-4abd-b01f-b28173d8eb04",
             "source_media_id": "src-1",
         })
-        assert err == "paygate_tier_unknown"
-        m.return_value.edit_image.assert_not_called()
+        assert err is None
+        _args, kwargs = m.return_value.edit_image.call_args
+        assert kwargs["paygate_tier"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_tier_label_comes_from_settings_when_nothing_is_live():
+    """The Settings value is the only source left on the migrated transport."""
+    from flowboard.services import settings_store
+
+    flow_client._paygate_tier = None
+    settings_store.set_many({"FLOW_PAYGATE_TIER": "PAYGATE_TIER_TWO"})
+    assert proc._tier_label({}) == "PAYGATE_TIER_TWO"
+    # A caller-stamped value still wins — that is what a re-run of an old row
+    # carries, and it describes what that row actually dispatched with.
+    assert proc._tier_label({"paygate_tier": "PAYGATE_TIER_ONE"}) == "PAYGATE_TIER_ONE"
 
 
 @pytest.mark.asyncio

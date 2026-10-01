@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from flowboard.services import media as media_service
+from flowboard.services import flow_batch as fb
 from flowboard.services import flow_sdk as flow_sdk_module
 from flowboard.worker.processor import _handle_gen_image
 
@@ -387,53 +388,81 @@ async def test_handle_gen_image_defaults_variant_count_to_1(monkeypatch):
     assert captured["variant_count"] == 1
 
 
-def test_gen_image_variant_count_replicates_request_items():
-    """Unit test against the SDK's request body — verify N items go out."""
-    from flowboard.services.flow_sdk import FlowSDK
+@pytest.mark.asyncio
+async def test_each_variant_is_its_own_rpc_with_its_own_seed(monkeypatch):
+    """Three variants means three RPCs, not one request carrying three items.
 
-    captured_body: dict = {}
+    That is not a design choice here -- Flow's own composer submits one per
+    variant, each with its own single-use captcha, and there is no "how many"
+    field in the payload. Distinct seeds are what stop three identical pictures.
+    """
+    from flowboard.services import flow_sdk
+    from tests.flow_fakes import BatchFakeClient, image_reply
 
-    class _FakeClient:
-        async def api_request(self, **kwargs):
-            captured_body["body"] = kwargs["body"]
-            return {"data": {"media": []}}
+    # The real launch cadence is 0/0.5/1.5/2.5s, copied from the UI so a burst
+    # does not look different to Google's abuse detection than a person does.
+    # Waiting it out here would buy nothing but seconds.
+    monkeypatch.setattr(flow_sdk, "IMAGE_SUBMIT_OFFSETS_S", (0.0, 0.0, 0.0, 0.0))
 
-    sdk = FlowSDK(client=_FakeClient())  # type: ignore[arg-type]
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply("11111111-1111-4111-8111-111111111111"))
+    sdk = flow_sdk.FlowSDK(client=fake)
 
-    import asyncio
-
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        sdk.gen_image(
-            prompt="p", project_id="abcd1234", variant_count=3,
-            paygate_tier="PAYGATE_TIER_ONE",
-        )
+    out = await sdk.gen_image(
+        prompt="p", project_id="abcd1234", variant_count=3,
+        paygate_tier="PAYGATE_TIER_ONE",
     )
-    items = captured_body["body"]["requests"]
-    assert len(items) == 3
-    seeds = [it["seed"] for it in items]
+    assert "error" not in out, out
+
+    calls = fake.calls_for(fb.RPC_GEN_IMAGE)
+    assert len(calls) == 3
+    seeds = [fake.payload_for(fb.RPC_GEN_IMAGE, i)[1][0][3] for i in range(3)]
     assert len(set(seeds)) == 3, "seeds must be distinct per variant"
+    # Every one of them carries a captcha slot. A variant that skipped it would
+    # be rejected after the others had already been minted and spent.
+    assert {c["captcha"] for c in calls} == {fb.CAPTCHA_IMAGE}
 
 
-def test_gen_image_variant_count_clamps_to_4():
-    from flowboard.services.flow_sdk import FlowSDK
+@pytest.mark.asyncio
+async def test_variant_count_clamps_to_four(monkeypatch):
+    from flowboard.services import flow_sdk
+    from tests.flow_fakes import BatchFakeClient, image_reply
 
-    captured_body: dict = {}
+    monkeypatch.setattr(flow_sdk, "IMAGE_SUBMIT_OFFSETS_S", (0.0, 0.0, 0.0, 0.0))
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply("22222222-2222-4222-8222-222222222222"))
+    sdk = flow_sdk.FlowSDK(client=fake)
 
-    class _FakeClient:
-        async def api_request(self, **kwargs):
-            captured_body["body"] = kwargs["body"]
-            return {"data": {"media": []}}
-
-    sdk = FlowSDK(client=_FakeClient())  # type: ignore[arg-type]
-    import asyncio
-
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        sdk.gen_image(
-            prompt="p", project_id="abcd1234", variant_count=99,
-            paygate_tier="PAYGATE_TIER_ONE",
-        )
+    await sdk.gen_image(
+        prompt="p", project_id="abcd1234", variant_count=99,
+        paygate_tier="PAYGATE_TIER_ONE",
     )
-    assert len(captured_body["body"]["requests"]) == 4
+    # Ninety-nine RPCs would be ninety-nine images, charged for.
+    assert len(fake.calls_for(fb.RPC_GEN_IMAGE)) == 4
+
+
+@pytest.mark.asyncio
+async def test_edit_image_puts_the_source_in_the_base_image_slot(monkeypatch):
+    """Wire type 2, not 1. The difference is editing this picture versus
+    generating a fresh one that merely resembles it -- and Flow accepts the
+    wrong slot, ignores it, and charges, which looks exactly like success."""
+    from flowboard.services import flow_sdk
+    from tests.flow_fakes import BatchFakeClient, image_reply
+
+    monkeypatch.setattr(flow_sdk, "IMAGE_SUBMIT_OFFSETS_S", (0.0, 0.0, 0.0, 0.0))
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply("33333333-3333-4333-8333-333333333333"))
+    sdk = flow_sdk.FlowSDK(client=fake)
+
+    await sdk.edit_image(
+        prompt="p", project_id="abcd1234",
+        source_media_id="base-1", ref_media_ids=["ref-1"],
+        paygate_tier="PAYGATE_TIER_ONE",
+    )
+    item = fake.payload_for(fb.RPC_GEN_IMAGE)[1][0]
+    image_inputs = item[2]
+    assert image_inputs[0] == ["base-1", None, None, None, fb.BASE_TYPE_IMAGE]
+    assert image_inputs[1] == ["ref-1", None, None, None, fb.REF_TYPE_IMAGE]
 
 
 # ── edit_image (refine) ───────────────────────────────────────────────────
@@ -477,32 +506,6 @@ async def test_handle_edit_image_rejects_missing_source(monkeypatch):
         {"prompt": "p", "project_id": "abcd1234"}
     )
     assert err == "missing_source_media_id"
-
-
-def test_edit_image_uses_base_image_input_type():
-    from flowboard.services.flow_sdk import FlowSDK
-
-    captured: dict = {}
-
-    class _FakeClient:
-        async def api_request(self, **kwargs):
-            captured["body"] = kwargs["body"]
-            return {"data": {"media": []}}
-
-    sdk = FlowSDK(client=_FakeClient())  # type: ignore[arg-type]
-    import asyncio
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-        sdk.edit_image(
-            prompt="p",
-            project_id="abcd1234",
-            source_media_id="base-1",
-            ref_media_ids=["ref-1"],
-            paygate_tier="PAYGATE_TIER_ONE",
-        )
-    )
-    inputs = captured["body"]["requests"][0]["imageInputs"]
-    assert inputs[0] == {"name": "base-1", "imageInputType": "IMAGE_INPUT_TYPE_BASE_IMAGE"}
-    assert inputs[1] == {"name": "ref-1", "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"}
 
 
 # ── visual_asset node type ────────────────────────────────────────────────

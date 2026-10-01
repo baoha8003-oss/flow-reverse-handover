@@ -240,3 +240,198 @@ async def test_real_claude_provider_delegates_to_claude_cli():
     assert kwargs["system_prompt"] == "s"
     assert kwargs["attachments"] == ["/x.jpg"]
     assert kwargs["timeout"] == 5.0
+
+
+# ── The internal-feature chain ─────────────────────────────────────────
+#
+# `run_llm` serves the three features the user pins in Settings, and it
+# refuses to substitute: the whole point of pinning is knowing which model
+# ran. `run_llm_chain` serves the steps nobody pins — rewriting a prompt
+# after a review, scoring a clip, drafting a script, emitting canvas
+# actions. There is no choice to honour there, so it walks a preference
+# order and takes the first provider that can answer.
+
+
+@pytest.mark.asyncio
+async def test_chain_takes_the_first_provider_that_answers(
+    tmp_secrets_path, fake_providers
+):
+    answer, used = await registry.run_llm_chain("revise", "sửa prompt")
+    assert (answer, used) == ("ok", "claude")
+    assert fake_providers["gemini"].run_calls == []
+
+
+@pytest.mark.asyncio
+async def test_chain_steps_over_an_unavailable_provider(
+    tmp_secrets_path, fake_providers
+):
+    """The Gemini-CLI-died case, for a step the user never configured."""
+    fake_providers["claude"]._available = False
+    answer, used = await registry.run_llm_chain("revise", "sửa prompt")
+    assert used == "openai", "revise prefers claude, then openai"
+    assert fake_providers["claude"].run_calls == [], "an unavailable provider is not called"
+
+
+@pytest.mark.asyncio
+async def test_chain_steps_over_a_provider_that_raises(
+    tmp_secrets_path, fake_providers
+):
+    """Available is not the same as working. A provider that accepts the
+    call and then fails must not end the chain."""
+    async def _boom(*a, **kw):
+        raise LLMError("quota exhausted")
+
+    fake_providers["claude"].run = _boom
+    answer, used = await registry.run_llm_chain("revise", "x")
+    assert (answer, used) == ("ok", "openai")
+
+
+@pytest.mark.asyncio
+async def test_chain_skips_providers_that_cannot_read_attachments(
+    tmp_secrets_path, fake_providers
+):
+    answer, used = await registry.run_llm_chain(
+        "canvas_agent", "đọc cái bảng này", attachments=["/tmp/sheet.png"],
+        providers=["textonly", "gemini"],
+    )
+    assert used == "gemini"
+    assert fake_providers["textonly"].run_calls == []
+
+
+@pytest.mark.asyncio
+async def test_chain_reports_every_provider_it_tried(tmp_secrets_path, fake_providers):
+    """"No provider could answer" with no detail is the error that costs an
+    hour. The message has to name what was tried and why each was passed
+    over, or the user cannot act on it."""
+    for fake in fake_providers.values():
+        fake._available = False
+
+    with pytest.raises(LLMError) as exc:
+        await registry.run_llm_chain("revise", "x")
+    message = str(exc.value)
+    for name in ("claude", "openai", "gemini"):
+        assert name in message, f"{name} missing from the error"
+    assert "not configured" in message
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_feature_name_raises(tmp_secrets_path, fake_providers):
+    """`revise_prompt` spent its life calling a feature named "text" that
+    never existed. The dispatcher tolerated it, so the review loop quietly
+    stopped rewriting instead of failing. A name with no chain now dies at
+    its first call."""
+    with pytest.raises(LLMError, match="No provider chain defined"):
+        await registry.run_llm_chain("nonsense", "x")
+
+
+@pytest.mark.asyncio
+async def test_the_pinned_provider_leads_the_chain(tmp_secrets_path, fake_providers):
+    """Rewriting a prompt is planner-shaped work. A user who pinned the
+    planner to Gemini should get Gemini for rewrites too, even though
+    `revise` prefers Claude by default and they never pinned it."""
+    secrets.set_feature_provider("planner", "gemini")
+    answer, used = await registry.run_llm_chain("revise", "x")
+    assert used == "gemini"
+    assert fake_providers["claude"].run_calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_provider_list_overrides_the_default_order(
+    tmp_secrets_path, fake_providers
+):
+    _, used = await registry.run_llm_chain("revise", "x", providers=["gemini", "claude"])
+    assert used == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_chain_forwards_all_kwargs(tmp_secrets_path, fake_providers):
+    await registry.run_llm_chain(
+        "revise", "user prompt",
+        system_prompt="be terse", attachments=["/tmp/a.jpg"], timeout=42.0,
+    )
+    call = fake_providers["claude"].run_calls[0]
+    assert call["system_prompt"] == "be terse"
+    assert call["attachments"] == ["/tmp/a.jpg"]
+    assert call["timeout"] == 42.0
+
+
+def test_every_internal_feature_has_a_chain():
+    """`InternalFeature` and `DEFAULT_CHAINS` have to agree — a feature in
+    the type with no chain raises at its first call, which is a runtime
+    discovery of a mistake visible right here."""
+    from typing import get_args
+
+    from flowboard.services.llm.registry import DEFAULT_CHAINS, InternalFeature
+
+    assert set(get_args(InternalFeature)) == set(DEFAULT_CHAINS)
+
+
+def test_every_chain_names_registered_providers_only():
+    from flowboard.services.llm.registry import DEFAULT_CHAINS, _PROVIDERS
+
+    for feature, chain in DEFAULT_CHAINS.items():
+        unknown = set(chain) - set(_PROVIDERS)
+        assert not unknown, f"{feature} chain names unregistered {unknown}"
+
+
+def test_pin_inheritance_points_at_real_features_on_both_sides():
+    """Inheritance maps an internal feature onto the pinned one it follows.
+    A typo on either side fails silently at runtime: the internal feature
+    simply stops inheriting and quietly falls back to the default order,
+    so the user's pinned choice gets ignored with nothing to show for it."""
+    from typing import get_args
+
+    from flowboard.services.llm.registry import (
+        Feature, InternalFeature, _INHERITS_PIN_FROM,
+    )
+
+    assert set(_INHERITS_PIN_FROM) <= set(get_args(InternalFeature))
+    assert set(_INHERITS_PIN_FROM.values()) <= set(get_args(Feature))
+
+
+# ── a chain step that breaks is that step breaking, not the chain ─────
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_raises_something_unexpected_is_stepped_over(
+    tmp_secrets_path, fake_providers
+):
+    """`prompt_relay` catches `LLMError` to degrade gracefully. Anything else
+    went straight past that guard and out of the route as a 500 — so one CLI
+    returning malformed bytes took down a request that had a working fallback
+    sitting behind it."""
+    async def _boom(*a, **kw):
+        raise ValueError("not JSON")
+
+    fake_providers["claude"].run = _boom
+    answer, used = await registry.run_llm_chain("revise", "x")
+    assert (answer, used) == ("ok", "openai")
+
+
+@pytest.mark.asyncio
+async def test_the_unexpected_failure_is_named_in_the_error(
+    tmp_secrets_path, fake_providers
+):
+    async def _boom(*a, **kw):
+        raise ValueError("not JSON")
+
+    for fake in fake_providers.values():
+        fake.run = _boom
+    with pytest.raises(LLMError) as exc:
+        await registry.run_llm_chain("revise", "x")
+    assert "ValueError" in str(exc.value)
+
+
+def test_the_billed_provider_is_last_in_every_chain():
+    """Stated in the table's own comment as the reason for the ordering, and
+    `canvas_agent` had Gemini second — which is where a chain lands whenever
+    the leader is signed out, i.e. the ordinary case."""
+    for feature, chain in registry.DEFAULT_CHAINS.items():
+        assert chain[-1] == "gemini", feature
+
+
+def test_there_is_no_chain_for_scoring_a_clip():
+    """It dispatches through the pinned `vision` feature, and a pinned feature
+    reports a dead provider rather than quietly using another one. A `review`
+    chain with no caller was drawn as a live route by the health panel."""
+    assert "review" not in registry.DEFAULT_CHAINS

@@ -54,32 +54,50 @@ def _stub_resolve(monkeypatch, path: str = "/fake/bin/codex"):
 
 
 def _stub_run(monkeypatch, dispatcher: Callable[[list[str], dict], _FakeResult]):
-    """Patch ``subprocess.run`` and route each call through ``dispatcher``.
+    """Patch ``run_cli`` and route each call through ``dispatcher``.
+
+    One seam, because the provider now has one: the ``--version`` and
+    ``--help`` probes used to call ``subprocess.run`` directly from a
+    coroutine — which pins the event loop for the length of the call — and
+    were moved onto the same worker-thread runner the dispatch already
+    used.
 
     The dispatcher receives the argv list + kwargs and decides what to
-    return. This shape lets each test branch on ``--version`` /
-    ``--help`` / actual dispatch arg patterns.
+    return, so each test can branch on ``--version`` / ``--help`` /
+    ``login status`` / actual dispatch arg patterns.
     """
     state: dict = {"calls": []}
 
-    def _run(*args, **kwargs):
-        argv = list(args[0])
+    async def _run(args, **kwargs):
+        argv = list(args)
         state["calls"].append((argv, kwargs))
         return dispatcher(argv, kwargs)
 
-    monkeypatch.setattr("flowboard.services.llm.openai.subprocess.run", _run)
+    monkeypatch.setattr("flowboard.services.llm.openai.run_cli", _run)
+    monkeypatch.setattr("flowboard.services.llm.cli_auth.run_cli", _run)
+    # Pinned so the auth probe cannot wander off to the real PATH (or, on
+    # a miss, to the npm-fallback lookup, which spawns a real process).
+    monkeypatch.setattr(
+        "flowboard.services.llm.cli_auth.resolve_cli_binary",
+        lambda *_a, **_kw: "codex",
+    )
     return state
 
 
-def _missing_codex(*_a, **_kw):
-    """Patch subprocess.run to raise FileNotFoundError (codex not on PATH)."""
+async def _missing_codex(*_a, **_kw):
+    """Patch run_cli to raise FileNotFoundError (codex not on PATH)."""
     raise FileNotFoundError("codex")
 
 
+#: What `codex login status` prints when signed in with a key. On stderr,
+#: which is where the real CLI puts it — stdout comes back empty.
+_AUTH_LINE = b"Logged in using an API key - sk-0000***0000\n"
+
+
 def _route_probe(version_rc: int = 0, help_image_flag: Optional[str] = "--image"):
-    """Return a dispatcher that handles only ``--version`` and ``--help``
-    (any other argv pattern triggers an AssertionError — useful for tests
-    that should not reach the dispatch path).
+    """Return a dispatcher that handles only the probes — ``--version``,
+    ``login status`` and ``--help``. Any other argv pattern raises, which
+    is what keeps tests that should not dispatch honest.
     """
     help_text = (
         f"  {help_image_flag} PATH\n".encode()
@@ -92,6 +110,8 @@ def _route_probe(version_rc: int = 0, help_image_flag: Optional[str] = "--image"
             return _FakeResult(returncode=version_rc, stdout=b"codex 1.0\n")
         if "--help" in argv:
             return _FakeResult(returncode=0, stdout=help_text)
+        if argv[-2:] == ["login", "status"]:
+            return _FakeResult(returncode=0, stderr=_AUTH_LINE)
         raise AssertionError(f"unexpected dispatch argv: {argv}")
 
     return dispatcher
@@ -184,8 +204,15 @@ async def test_probe_cli_runs_at_most_once(tmp_secrets_path, monkeypatch):
     await p._probe_cli()
     await p._probe_cli()
     await p._probe_cli()
-    # First probe = --version + --help = 2 spawns; subsequent calls = 0.
-    assert len(state["calls"]) == 2
+    # First probe spawns three: `--version`, `login status`, `--help`.
+    # Every later call spawns nothing. The count matters because the
+    # Settings panel polls this every 30 seconds — an uncached auth probe
+    # would mean a subprocess per poll, forever.
+    assert [argv for argv, _ in state["calls"]] == [
+        ["/fake/bin/codex", "--version"],
+        ["codex", "login", "status"],
+        ["/fake/bin/codex", "--help"],
+    ]
 
 
 # ── is_available ───────────────────────────────────────────────────────
@@ -250,17 +277,47 @@ async def test_mode_returns_none_when_nothing_configured(tmp_secrets_path, monke
 # ── run — CLI dispatch ────────────────────────────────────────────────
 
 
-def _route_dispatch(envelope_stdout: bytes, *, image_flag: Optional[str] = "--image"):
-    """Probe + dispatch in one dispatcher: --version/--help return probe
-    fixtures, anything else returns the supplied envelope."""
+def _stub_dispatch(
+    monkeypatch,
+    *,
+    answer: str = "hello text",
+    returncode: int = 0,
+    stderr: bytes = b"",
+    write: bool = True,
+    image_flag: Optional[str] = "--image",
+):
+    """Stub the CLI and record only the real dispatch.
+
+    Probes and dispatch now share one seam (`run_cli`), so this routes:
+    anything matching a probe argv is answered by `_route_probe`, and only
+    a genuine dispatch is recorded in `state["calls"]` — otherwise every
+    assertion about "the call" would have to count past three probes.
+
+    The dispatch honours the real contract — `--output-last-message FILE`,
+    a plain-text answer written to that file — rather than an envelope on
+    stdout, which is what these tests wrongly asserted before the CLI's
+    actual interface was measured.
+    """
     probe = _route_probe(help_image_flag=image_flag)
+    state: dict = {"calls": []}
 
-    def dispatcher(argv: list[str], kwargs: dict) -> _FakeResult:
-        if "--version" in argv or "--help" in argv:
-            return probe(argv, kwargs)
-        return _FakeResult(returncode=0, stdout=envelope_stdout)
+    async def _dispatch(argv, *, stdin_data=b"", timeout=None, env=None):
+        argv = list(argv)
+        if "--version" in argv or "--help" in argv or argv[-2:] == ["login", "status"]:
+            return probe(argv, {})
+        state["calls"].append((argv, {"stdin_data": stdin_data, "env": env}))
+        if write:
+            out = argv[argv.index("--output-last-message") + 1]
+            Path(out).write_text(answer, encoding="utf-8")
+        return _FakeResult(returncode=returncode, stderr=stderr)
 
-    return dispatcher
+    monkeypatch.setattr("flowboard.services.llm.openai.run_cli", _dispatch)
+    monkeypatch.setattr("flowboard.services.llm.cli_auth.run_cli", _dispatch)
+    monkeypatch.setattr(
+        "flowboard.services.llm.cli_auth.resolve_cli_binary",
+        lambda *_a, **_kw: "codex",
+    )
+    return state
 
 
 @pytest.mark.asyncio
@@ -268,30 +325,25 @@ async def test_run_text_via_cli_when_codex_available(
     tmp_secrets_path, monkeypatch
 ):
     """Critical Windows fix: prompt is delivered via stdin (kwargs['input'])
-    rather than ``-p <prompt>`` argv. Same ``.cmd`` shim rationale as
-    claude_cli — cmd.exe re-parses argv for ``.cmd`` shims and mangles
-    long prompts. ``-p -`` argv signals stdin to codex."""
+    rather than argv. Same ``.cmd`` shim rationale as claude_cli — cmd.exe
+    re-parses argv for ``.cmd`` shims and mangles long prompts. A trailing
+    ``-`` is what tells codex to read stdin.
+
+    The system prompt is folded into that text: this CLI has no ``--system``
+    flag, and passing one made every dispatch fail at argument parsing."""
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
-    state = _stub_run(
-        monkeypatch,
-        _route_dispatch(b'{"result": "hello text"}\n'),
-    )
+    state = _stub_dispatch(monkeypatch, answer="hello text")
     out = await p.run("hi", system_prompt="be terse")
     assert out == "hello text"
-    # Pull the dispatch call (skip --version + --help probes).
-    dispatch_calls = [
-        (argv, kwargs) for argv, kwargs in state["calls"]
-        if "--version" not in argv and "--help" not in argv
-    ]
-    assert len(dispatch_calls) == 1
-    argv, kwargs = dispatch_calls[0]
+    assert len(state["calls"]) == 1
+    argv, kwargs = state["calls"][0]
     assert "exec" in argv
-    assert "-p" in argv and "-" in argv
-    # Prompt is on stdin, not in argv.
-    assert kwargs["input"] == b"hi"
+    assert argv[-1] == "-"
+    assert "--system" not in argv
+    stdin = kwargs["stdin_data"].decode()
+    assert "hi" in stdin and "be terse" in stdin
     assert "hi" not in argv
-    assert "--system" in argv
 
 
 @pytest.mark.asyncio
@@ -306,10 +358,7 @@ async def test_run_vision_via_cli_when_image_flag_resolved(
 
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
-    state = _stub_run(
-        monkeypatch,
-        _route_dispatch(b'{"result": "described"}\n', image_flag="--image"),
-    )
+    state = _stub_dispatch(monkeypatch, answer="described", image_flag="--image")
     # Stub httpx to assert it's never called.
     httpx_called = {"n": 0}
 
@@ -392,10 +441,7 @@ async def test_run_text_via_codex_text_only_works(
     falls back. Sanity check that the mode-routing doesn't over-trigger."""
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
-    _stub_run(
-        monkeypatch,
-        _route_dispatch(b'{"result": "text answer"}\n', image_flag=None),
-    )
+    _stub_dispatch(monkeypatch, answer="text answer", image_flag=None)
     out = await p.run("hi")
     assert out == "text answer"
 
@@ -428,35 +474,35 @@ async def test_run_raises_when_neither_cli_nor_key(tmp_secrets_path, monkeypatch
         await p.run("hi")
 
 
-# ── CLI envelope error handling ───────────────────────────────────────
+# ── CLI failure handling ──────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_cli_envelope_error_field_raises(tmp_secrets_path, monkeypatch):
+async def test_a_failing_cli_surfaces_its_own_stderr(tmp_secrets_path, monkeypatch):
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
-    _stub_run(
-        monkeypatch,
-        _route_dispatch(b'{"is_error": true, "error": "auth required"}\n'),
-    )
-    with pytest.raises(LLMError, match="codex CLI reported error"):
+    _stub_dispatch(monkeypatch, returncode=1, stderr=b"auth required", write=False)
+    with pytest.raises(LLMError, match="auth required"):
         await p.run("hi")
 
 
 @pytest.mark.asyncio
-async def test_cli_envelope_accepts_alternate_field_names(
+async def test_an_empty_answer_is_a_failure_not_a_result(
     tmp_secrets_path, monkeypatch
 ):
-    """Codex CLI's output field name has shifted between versions — accept
-    `result`, `output_text`, or `text`."""
+    """This test used to assert that the CLI returns a JSON envelope whose
+    output field name drifts between versions. It does not, and never did:
+    it writes the final message as plain text to the file named by
+    `--output-last-message`. The old contract passed here while every real
+    dispatch failed at argument parsing.
+
+    An empty file means the run produced nothing; returning "" would hand
+    the caller a blank string as if it were an answer."""
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
-    _stub_run(
-        monkeypatch,
-        _route_dispatch(b'{"output_text": "via output_text"}\n'),
-    )
-    out = await p.run("hi")
-    assert out == "via output_text"
+    _stub_dispatch(monkeypatch, answer="   ")
+    with pytest.raises(LLMError, match="empty"):
+        await p.run("hi")
 
 
 @pytest.mark.asyncio
@@ -464,13 +510,6 @@ async def test_cli_nonzero_exit_raises(tmp_secrets_path, monkeypatch):
     p = OpenAIProvider()
     _stub_resolve(monkeypatch)
 
-    def dispatcher(argv: list[str], kwargs: dict) -> _FakeResult:
-        if "--version" in argv:
-            return _FakeResult(returncode=0, stdout=b"codex 1.0\n")
-        if "--help" in argv:
-            return _FakeResult(returncode=0, stdout=b"  --image PATH\n")
-        return _FakeResult(returncode=1, stderr=b"login required")
-
-    _stub_run(monkeypatch, dispatcher)
+    _stub_dispatch(monkeypatch, returncode=1, stderr=b"login required", write=False)
     with pytest.raises(LLMError, match="codex CLI exited 1"):
         await p.run("hi")

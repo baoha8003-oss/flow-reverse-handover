@@ -1,0 +1,605 @@
+[
+ {
+  "group": "gpt",
+  "name": "breeze",
+  "f0": 168.4,
+  "target": "Pulcherrima",
+  "target_f0": 168.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "gpt",
+  "name": "cove",
+  "f0": 91.2,
+  "target": "Algenib",
+  "target_f0": 95.0,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "gpt",
+  "name": "ember",
+  "f0": 113.5,
+  "target": "Puck",
+  "target_f0": 110.3,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "gpt",
+  "name": "fathom",
+  "f0": 105.6,
+  "target": "Puck",
+  "target_f0": 110.3,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "gpt",
+  "name": "glimmer",
+  "f0": 192.8,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "gpt",
+  "name": "juniper",
+  "f0": 192.8,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "gpt",
+  "name": "maple",
+  "f0": 202.5,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "gpt",
+  "name": "orbit",
+  "f0": 101.9,
+  "target": "Algieba",
+  "target_f0": 99.1,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "gpt",
+  "name": "vale",
+  "f0": 160.0,
+  "target": "Achird",
+  "target_f0": 162.4,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Alex Đại Đế",
+  "f0": 164.9,
+  "target": "Achird",
+  "target_f0": 162.4,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Ban Mai",
+  "f0": 210.5,
+  "target": "Gacrux",
+  "target_f0": 207.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Bản Tin 1",
+  "f0": 216.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Bản Tin nữ",
+  "f0": 209.2,
+  "target": "Gacrux",
+  "target_f0": 207.8,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Cô Gái Hoạt Ngôn",
+  "f0": 242.4,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Giọng Bé",
+  "f0": 290.9,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Giọng Gái Mới Lớn",
+  "f0": 266.7,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Giọng Nam Trầm",
+  "f0": 152.4,
+  "target": "Rasalgethi",
+  "target_f0": 148.1,
+  "rule": "name+pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Giọng Nữ Phổ Thông",
+  "f0": 200.0,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Kenny Đại Đế",
+  "f0": 120.3,
+  "target": "Enceladus",
+  "target_f0": 124.5,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Mai",
+  "f0": 256.0,
+  "target": "Kore",
+  "target_f0": 254.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Nam bản tin",
+  "f0": 238.8,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Nhỏ Ngọt Ngào",
+  "f0": 246.2,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Quên Tên Tự Test",
+  "f0": 248.1,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Review Phim 2",
+  "f0": 242.4,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Review Phim 3",
+  "f0": 213.3,
+  "target": "Gacrux",
+  "target_f0": 207.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Review Phim 4",
+  "f0": 225.4,
+  "target": "Zephyr",
+  "target_f0": 225.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Review Phim new",
+  "f0": 201.3,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Robot VN",
+  "f0": 163.3,
+  "target": "Achird",
+  "target_f0": 162.4,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Sunny Idol",
+  "f0": 228.6,
+  "target": "Zephyr",
+  "target_f0": 225.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Thanh Niên Tự Tin",
+  "f0": 155.3,
+  "target": "Achird",
+  "target_f0": 162.4,
+  "rule": "name+pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_vi",
+  "name": "Việt Méo",
+  "f0": 158.4,
+  "target": "Achird",
+  "target_f0": 162.4,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "American Female",
+  "f0": 225.4,
+  "target": "Zephyr",
+  "target_f0": 225.4,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Artist",
+  "f0": 254.0,
+  "target": "Kore",
+  "target_f0": 254.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Bluetooth",
+  "f0": 192.8,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "BrianJW",
+  "f0": 175.8,
+  "target": "Vindemiatrix",
+  "target_f0": 175.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Captain",
+  "f0": 307.7,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Chrming Male",
+  "f0": 165.0,
+  "target": "Iapetus",
+  "target_f0": 167.5,
+  "rule": "name+pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Classical Music",
+  "f0": 301.9,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Creepy female",
+  "f0": 235.3,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Cute Boy",
+  "f0": 313.7,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Cute Girl",
+  "f0": 275.9,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Daiana",
+  "f0": 197.5,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Deadpool",
+  "f0": 118.5,
+  "target": "Enceladus",
+  "target_f0": 124.5,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Dolly famle",
+  "f0": 280.7,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Dramaaa",
+  "f0": 195.1,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Emotional",
+  "f0": 213.3,
+  "target": "Gacrux",
+  "target_f0": 207.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "EN US 2",
+  "f0": 175.8,
+  "target": "Vindemiatrix",
+  "target_f0": 175.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "EN US",
+  "f0": 290.9,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Energetic Famale",
+  "f0": 271.2,
+  "target": "Despina",
+  "target_f0": 271.2,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "English",
+  "f0": 128.0,
+  "target": "Umbriel",
+  "target_f0": 130.1,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Excited",
+  "f0": 258.1,
+  "target": "Kore",
+  "target_f0": 254.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Female Teacher",
+  "f0": 195.1,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "name+pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Grim Rock",
+  "f0": 216.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Janeamber",
+  "f0": 222.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Jessie",
+  "f0": 248.1,
+  "target": "Laomedeia",
+  "target_f0": 242.4,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Kai",
+  "f0": 146.1,
+  "target": "Fenrir",
+  "target_f0": 145.5,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Lisa",
+  "f0": 113.5,
+  "target": "Puck",
+  "target_f0": 110.3,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Male Profess",
+  "f0": 105.3,
+  "target": "Puck",
+  "target_f0": 110.3,
+  "rule": "name+pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Mentor",
+  "f0": 122.1,
+  "target": "Enceladus",
+  "target_f0": 124.5,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Mischief",
+  "f0": 219.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Narrator",
+  "f0": 120.3,
+  "target": "Enceladus",
+  "target_f0": 124.5,
+  "rule": "pitch",
+  "gender": "male"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Oogie",
+  "f0": 222.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Robaa",
+  "f0": 197.5,
+  "target": "Achernar",
+  "target_f0": 200.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Sherry",
+  "f0": 213.3,
+  "target": "Gacrux",
+  "target_f0": 207.8,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Suaraaa",
+  "f0": 262.3,
+  "target": "Kore",
+  "target_f0": 254.0,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Tinn",
+  "f0": 222.2,
+  "target": "Sulafat",
+  "target_f0": 222.2,
+  "rule": "pitch",
+  "gender": "female"
+ },
+ {
+  "group": "capcut_en",
+  "name": "Trickster",
+  "f0": 142.9,
+  "target": "Fenrir",
+  "target_f0": 145.5,
+  "rule": "pitch",
+  "gender": "male"
+ }
+]

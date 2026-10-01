@@ -252,3 +252,40 @@ def test_delete_node_cascades_edges(client):
     # edge is gone server-side
     detail = client.get(f"/api/boards/{b['id']}").json()
     assert detail["edges"] == []
+
+
+# ── deleting a node keeps the history it does not own ─────────────────
+
+
+def test_deleting_a_node_detaches_its_spend_record_instead_of_deleting_it(client):
+    """`Request` and `Asset` outlive the node on purpose.
+
+    A Request is what a generation was charged against, and an Asset is media
+    the user may still be referencing. Their `node_id` is nullable precisely so
+    they survive. Deleting them instead loses the spend record; leaving them
+    attached raises a FOREIGN KEY error that aborts the whole transaction — the
+    canvas showed the node gone while the backend had kept it, and it came back
+    on reload with no error anywhere.
+    """
+    from flowboard.db import get_session
+    from flowboard.db.models import Asset, Request
+
+    node = _make_image_node(client)
+    with get_session() as s:
+        s.add(Request(type="gen_image", params={}, status="done", node_id=node["id"]))
+        s.add(Asset(node_id=node["id"], kind="image", uuid_media_id="m-1"))
+        s.commit()
+
+    r = client.delete(f"/api/nodes/{node['id']}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["detached_requests"] == 1
+    assert body["detached_assets"] == 1
+
+    with get_session() as s:
+        from sqlmodel import select
+
+        requests = list(s.exec(select(Request)).all())
+        assets = list(s.exec(select(Asset)).all())
+    assert len(requests) == 1 and requests[0].node_id is None
+    assert len(assets) == 1 and assets[0].node_id is None

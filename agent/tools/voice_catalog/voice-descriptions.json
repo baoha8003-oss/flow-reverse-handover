@@ -1,0 +1,122 @@
+{
+ "Achernar": {
+  "gender": "female",
+  "description": "Nữ, mềm mại, âm vực cao."
+ },
+ "Aoede": {
+  "gender": "female",
+  "description": "Nữ, nhẹ nhàng, phóng khoáng, âm vực trung."
+ },
+ "Autonoe": {
+  "gender": "female",
+  "description": "Nữ, tươi sáng, rõ ràng, âm vực trung."
+ },
+ "Callirrhoe": {
+  "gender": "female",
+  "description": "Nữ, thoải mái, tự nhiên, âm vực trung."
+ },
+ "Despina": {
+  "gender": "female",
+  "description": "Nữ, mượt mà, âm vực trung."
+ },
+ "Erinome": {
+  "gender": "female",
+  "description": "Nữ, trong trẻo, rõ chữ, âm vực trung."
+ },
+ "Gacrux": {
+  "gender": "female",
+  "description": "Nữ, trưởng thành, chững chạc, âm vực trung."
+ },
+ "Kore": {
+  "gender": "female",
+  "description": "Nữ, chắc chắn, dứt khoát, âm vực trung."
+ },
+ "Laomedeia": {
+  "gender": "female",
+  "description": "Nữ, vui tươi, giàu năng lượng, âm vực trung-cao."
+ },
+ "Leda": {
+  "gender": "female",
+  "description": "Nữ, trẻ trung, tươi mới, chất giọng trẻ."
+ },
+ "Pulcherrima": {
+  "gender": "female",
+  "description": "Nữ, tự tin, tiến về phía trước, âm vực trung."
+ },
+ "Sulafat": {
+  "gender": "female",
+  "description": "Nữ, ấm áp, gần gũi, âm vực trung."
+ },
+ "Vindemiatrix": {
+  "gender": "female",
+  "description": "Nữ, dịu dàng, mềm mại, âm vực trung."
+ },
+ "Zephyr": {
+  "gender": "female",
+  "description": "Nữ, tươi sáng, nổi bật, âm vực trung-cao."
+ },
+ "Achird": {
+  "gender": "male",
+  "description": "Nam, thân thiện, âm vực trung."
+ },
+ "Algenib": {
+  "gender": "male",
+  "description": "Nam, khàn và có độ sạn, âm vực thấp."
+ },
+ "Algieba": {
+  "gender": "male",
+  "description": "Nam, thoải mái, dễ nghe, âm vực trung-thấp."
+ },
+ "Alnilam": {
+  "gender": "male",
+  "description": "Nam, chắc chắn, dứt khoát, âm vực trung-thấp."
+ },
+ "Charon": {
+  "gender": "male",
+  "description": "Nam, giàu tính thuyết minh, âm vực thấp."
+ },
+ "Enceladus": {
+  "gender": "male",
+  "description": "Nam, nhiều hơi, nhẹ và mềm, âm vực thấp."
+ },
+ "Fenrir": {
+  "gender": "male",
+  "description": "Nam, hào hứng, sôi nổi, chất giọng trẻ."
+ },
+ "Iapetus": {
+  "gender": "male",
+  "description": "Nam, rõ nét, mạch lạc, âm vực trung-thấp."
+ },
+ "Orus": {
+  "gender": "male",
+  "description": "Nam, mạnh mẽ, chắc giọng, âm vực trung-thấp."
+ },
+ "Puck": {
+  "gender": "male",
+  "description": "Nam, vui vẻ, tích cực, âm vực trung."
+ },
+ "Rasalgethi": {
+  "gender": "male",
+  "description": "Nam, giàu tính thông tin, âm vực trung."
+ },
+ "Sadachbia": {
+  "gender": "male",
+  "description": "Nam, sinh động, hoạt bát, âm vực thấp."
+ },
+ "Sadaltager": {
+  "gender": "male",
+  "description": "Nam, hiểu biết, mang chất chuyên gia, âm vực trung."
+ },
+ "Schedar": {
+  "gender": "male",
+  "description": "Nam, đều đặn, ổn định, âm vực trung-thấp."
+ },
+ "Umbriel": {
+  "gender": "male",
+  "description": "Nam, mượt mà, nhẹ nhàng, âm vực thấp."
+ },
+ "Zubenelgenubi": {
+  "gender": "male",
+  "description": "Nam, tự nhiên, đời thường, âm vực trung-thấp."
+ }
+}

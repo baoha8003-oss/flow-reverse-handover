@@ -907,10 +907,65 @@ async def test_auto_prompt_caps_long_responses(client, monkeypatch):
     assert out.endswith("…")
 
 
+def test_route_lists_video_styles(client):
+    r = client.get("/api/prompt/styles")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body, list)
+    # The library ships with the packaged tool; when it is absent the route
+    # must still answer with an empty list rather than error.
+    for entry in body:
+        assert entry["name"] and entry["description"]
+
+
+def test_route_passes_style_arg_through(client, monkeypatch):
+    ids = _seed_board_with_chain()
+    captured: dict = {}
+
+    async def stub(node_id, *, camera=None, style=None):
+        captured["style"] = style
+        return "ok"
+
+    monkeypatch.setattr(prompt_synth, "auto_prompt", stub)
+    r = client.post(
+        "/api/prompt/auto",
+        json={"node_id": ids["target_id"], "style": "Pixar"},
+    )
+    assert r.status_code == 200, r.text
+    assert captured["style"] == "Pixar"
+
+
+@pytest.mark.asyncio
+async def test_auto_prompt_appends_style_directive_to_system_prompt(
+    client, monkeypatch
+):
+    """A named style must reach the model, and must come last so it wins
+    over the default editorial look baked into the system prompt."""
+    ids = _seed_board_with_chain()
+    captured: dict = {}
+
+    async def stub_run(feature, prompt, *, system_prompt=None, timeout=0):
+        captured["system_prompt"] = system_prompt or ""
+        return "a prompt"
+
+    monkeypatch.setattr(prompt_synth, "run_llm", stub_run)
+    monkeypatch.setattr(
+        prompt_synth.styles,
+        "style_directive",
+        lambda name: "\n\nVISUAL STYLE — marker\n" if name == "Pixar" else "",
+    )
+
+    await prompt_synth.auto_prompt(ids["target_id"], style="Pixar")
+    assert captured["system_prompt"].endswith("VISUAL STYLE — marker\n")
+
+    await prompt_synth.auto_prompt(ids["target_id"], style=None)
+    assert "VISUAL STYLE — marker" not in captured["system_prompt"]
+
+
 def test_route_happy_path(client, monkeypatch):
     ids = _seed_board_with_chain()
 
-    async def stub(node_id, *, camera=None):
+    async def stub(node_id, *, camera=None, style=None):
         assert node_id == ids["target_id"]
         return "synthesized prompt"
 
@@ -926,7 +981,7 @@ def test_route_passes_camera_arg_through(client, monkeypatch):
     ids = _seed_board_with_chain()
     captured: dict = {}
 
-    async def stub(node_id, *, camera=None):
+    async def stub(node_id, *, camera=None, style=None):
         captured["camera"] = camera
         return "ok"
 
@@ -1017,19 +1072,22 @@ def test_route_auto_batch_passes_through(client, monkeypatch):
     ids = _seed_board_with_chain()
     captured: dict = {}
 
-    async def stub(node_id, count, *, camera=None):
+    async def stub(node_id, count, *, camera=None, style=None):
         captured["count"] = count
+        captured["style"] = style
         return [f"prompt-{i}" for i in range(count)]
 
     monkeypatch.setattr(prompt_synth, "auto_prompt_batch", stub)
     r = client.post(
         "/api/prompt/auto-batch",
-        json={"node_id": ids["target_id"], "count": 4},
+        json={"node_id": ids["target_id"], "count": 4, "style": "cinematic"},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert len(body["prompts"]) == 4
     assert captured["count"] == 4
+    # The batch path honours the same style preset as the single-prompt one.
+    assert captured["style"] == "cinematic"
 
 
 def test_route_auto_batch_rejects_bad_count(client):
@@ -1041,7 +1099,7 @@ def test_route_auto_batch_rejects_bad_count(client):
 
 
 def test_route_502_on_synth_failure(client, monkeypatch):
-    async def stub(node_id, *, camera=None):
+    async def stub(node_id, *, camera=None, style=None):
         raise prompt_synth.PromptSynthError("auto-prompt provider failed: timeout")
 
     monkeypatch.setattr(prompt_synth, "auto_prompt", stub)

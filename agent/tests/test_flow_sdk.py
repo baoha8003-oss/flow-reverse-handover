@@ -1,921 +1,790 @@
-"""Tests for the minimal Flow SDK. Uses a recording fake FlowClient so we can
-assert on the JSON-RPC shape without touching a real WS.
+"""The Flow SDK on the `batchexecute` transport.
+
+Every test here drives `BatchFakeClient`, which answers with the real wire shape
+— sentinel, length prefix, `["wrb.fr", rpcid, "<payload>"]` — so the production
+parser runs rather than a convenient stand-in for it. And every assertion about
+what was SENT reads the envelope out of `calls`, because the failure mode this
+transport punishes is a payload Flow accepts, quietly ignores, and charges for:
+from the outside that looks exactly like success.
+
+This module replaced a REST-shaped one of the same size. The behaviours worth
+keeping were kept and re-pointed; the ones that described `aisandbox-pa.googleapis.com`
+response bodies went with the transport, because Flow stopped authenticating it.
 """
-from typing import Any
+from __future__ import annotations
+
+import json
 
 import pytest
 
-from flowboard.services.flow_sdk import (
-    FlowSDK,
-    _extract_inner_api_error,
-    _extract_project_id,
-    _extract_media_ids,
-    extract_media_entries,
-    extract_operation_names,
-    extract_video_operations,
-    extract_video_workflows,
+from flowboard.services import flow_batch as fb
+from flowboard.services import flow_sdk
+from flowboard.services.flow_sdk import FlowSDK
+from tests.flow_fakes import (
+    BatchFakeClient,
+    envelope,
+    image_reply,
+    listing_window,
+    media_reply,
+    operation_reply,
 )
 
-
-class RecordingClient:
-    def __init__(self) -> None:
-        self.api_calls: list[dict[str, Any]] = []
-        self.trpc_calls: list[dict[str, Any]] = []
-        self.trpc_response: dict[str, Any] = {}
-        self.api_response: dict[str, Any] = {}
-
-    async def api_request(self, **kwargs):
-        self.api_calls.append(kwargs)
-        return self.api_response
-
-    async def trpc_request(self, **kwargs):
-        self.trpc_calls.append(kwargs)
-        return self.trpc_response
+PROJECT = "11111111-1111-4111-8111-111111111111"
+MEDIA = "22222222-2222-4222-8222-222222222222"
+OTHER_MEDIA = "33333333-3333-4333-8333-333333333333"
+LANDSCAPE = "VIDEO_ASPECT_RATIO_LANDSCAPE"
+PORTRAIT = "VIDEO_ASPECT_RATIO_PORTRAIT"
 
 
-def _make_project_response(project_id: str = "proj-123") -> dict:
-    return {
-        "status": 200,
-        "data": {
-            "result": {"data": {"json": {"result": {"projectId": project_id}}}}
-        },
-    }
+@pytest.fixture(autouse=True)
+def _no_waiting(monkeypatch):
+    """Strip the deliberate pacing so the suite does not sit through it.
 
-
-def _make_gen_image_response(ids: list[str], with_urls: bool = False) -> dict:
-    media = []
-    for mid in ids:
-        item: dict[str, Any] = {"name": mid}
-        if with_urls:
-            item["image"] = {
-                "generatedImage": {
-                    "fifeUrl": f"https://flow-content.google/image/{mid}?sig=xyz",
-                    "mediaId": mid,
-                },
-            }
-        media.append(item)
-    return {"status": 200, "data": {"media": media}}
-
-
-@pytest.mark.asyncio
-async def test_create_project_body_shape_and_id_extraction():
-    c = RecordingClient()
-    c.trpc_response = _make_project_response("p-xyz")
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.create_project("Test Board")
-
-    assert len(c.trpc_calls) == 1
-    call = c.trpc_calls[0]
-    assert call["url"] == "https://labs.google/fx/api/trpc/project.createProject"
-    assert call["method"] == "POST"
-    assert call["body"] == {
-        "json": {"projectTitle": "Test Board", "toolName": "PINHOLE"}
-    }
-    assert call["headers"]["content-type"] == "application/json"
-    assert out["project_id"] == "p-xyz"
-    assert out["raw"]["status"] == 200
-
-
-@pytest.mark.asyncio
-async def test_create_project_surfaces_error_when_id_missing():
-    c = RecordingClient()
-    c.trpc_response = {"status": 200, "data": {"result": {"data": {"json": {}}}}}
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.create_project("x")
-    assert "project_id" not in out
-    assert out["error"] == "no_project_id_in_response"
-
-
-@pytest.mark.asyncio
-async def test_create_project_passes_extension_error_through():
-    c = RecordingClient()
-    c.trpc_response = {"error": "extension_disconnected"}
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.create_project("x")
-    assert out["error"] == "extension_disconnected"
-    assert out["raw"] == {"error": "extension_disconnected"}
-
-
-@pytest.mark.asyncio
-async def test_gen_image_body_shape_includes_captcha_and_context():
-    c = RecordingClient()
-    c.api_response = _make_gen_image_response(["m-1", "m-2"])
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_image(
-        prompt="a sleeping cat",
-        project_id="proj-123",
-        aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
-        paygate_tier="PAYGATE_TIER_ONE",
-    )
-
-    assert len(c.api_calls) == 1
-    call = c.api_calls[0]
-    assert call["captcha_action"] == "IMAGE_GENERATION"
-    assert call["method"] == "POST"
-    assert call["url"].endswith("/v1/projects/proj-123/flowMedia:batchGenerateImages")
-
-    body = call["body"]
-    assert body["clientContext"]["projectId"] == "proj-123"
-    assert body["clientContext"]["recaptchaContext"]["token"] == ""  # extension fills in
-    assert body["clientContext"]["userPaygateTier"] == "PAYGATE_TIER_ONE"
-
-    assert body["useNewMedia"] is True
-    assert "batchId" in body["mediaGenerationContext"]
-    req = body["requests"][0]
-    assert req["imageAspectRatio"] == "IMAGE_ASPECT_RATIO_LANDSCAPE"
-    assert req["structuredPrompt"]["parts"][0]["text"] == "a sleeping cat"
-    assert req["imageModelName"] == "GEM_PIX_2"
-    assert isinstance(req["seed"], int)
-
-    assert out["media_ids"] == ["m-1", "m-2"]
-
-
-@pytest.mark.asyncio
-async def test_gen_image_resolves_image_model_nickname_to_flow_id():
-    """The user-facing nickname (NANO_BANANA_PRO / NANO_BANANA_2) must
-    map to the correct Flow model identifier in the request body. Tests
-    both branches plus the unknown-key fallback to Pro."""
-    c = RecordingClient()
-    c.api_response = _make_gen_image_response(["m-1"])
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-
-    # Banana 2 → NARWHAL
-    await sdk.gen_image(
-        prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE",
-        image_model="NANO_BANANA_2",
-    )
-    assert c.api_calls[-1]["body"]["requests"][0]["imageModelName"] == "NARWHAL"
-
-    # Pro explicit → GEM_PIX_2
-    await sdk.gen_image(
-        prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE",
-        image_model="NANO_BANANA_PRO",
-    )
-    assert c.api_calls[-1]["body"]["requests"][0]["imageModelName"] == "GEM_PIX_2"
-
-    # Unknown key → fallback to Pro (defends against stale frontend).
-    await sdk.gen_image(
-        prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE",
-        image_model="BOGUS_MODEL",
-    )
-    assert c.api_calls[-1]["body"]["requests"][0]["imageModelName"] == "GEM_PIX_2"
-
-    # Default image_model (no kwarg) → Pro.
-    await sdk.gen_image(prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE")
-    assert c.api_calls[-1]["body"]["requests"][0]["imageModelName"] == "GEM_PIX_2"
-
-
-def test_resolve_image_model_helper_accepts_known_keys_only():
-    from flowboard.services.flow_sdk import resolve_image_model
-
-    assert resolve_image_model("NANO_BANANA_PRO") == "GEM_PIX_2"
-    assert resolve_image_model("NANO_BANANA_2") == "NARWHAL"
-    # Anything else falls back to Pro — defense-in-depth.
-    assert resolve_image_model("UNKNOWN") == "GEM_PIX_2"
-    assert resolve_image_model("") == "GEM_PIX_2"
-    assert resolve_image_model(None) == "GEM_PIX_2"
-
-
-def test_client_context_rejects_invalid_paygate_tier():
-    """Defense-in-depth — a stale frontend or buggy caller passing a
-    garbage tier MUST NOT silently coerce to TIER_ONE (the pre-v1.1.5
-    behaviour, which was the silent-Pro-downgrade footgun). Now the
-    chokepoint raises ValueError so a code regression fails loud
-    instead of serving Ultra users at the Pro checkpoint.
+    The real cadence matters — a burst of four submits looks different to
+    Google's abuse detection than a person does, and the `[8]` retry waits out a
+    cooldown because an immediate retry is refused again. Both are asserted by
+    their own tests below rather than by elapsed time.
     """
-    import pytest as _pytest
-
-    from flowboard.services.flow_sdk import _client_context
-
-    # Known good values pass through unchanged.
-    one = _client_context("p", "PAYGATE_TIER_ONE")
-    assert one["userPaygateTier"] == "PAYGATE_TIER_ONE"
-    two = _client_context("p", "PAYGATE_TIER_TWO")
-    assert two["userPaygateTier"] == "PAYGATE_TIER_TWO"
-
-    # Unknown / malformed values raise loudly (not silent coerce).
-    for bad in ("PAYGATE_TIER_THREE", "", "<script>", "PAYGATE_TIER_FREE"):
-        with _pytest.raises(ValueError, match="invalid paygate_tier"):
-            _client_context("p", bad)
+    monkeypatch.setattr(flow_sdk, "IMAGE_SUBMIT_OFFSETS_S", (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(flow_sdk, "IMAGE_TRANSIENT_RETRY_DELAY_S", 0.0)
+    monkeypatch.setattr(flow_sdk, "VIDEO_SUBMIT_GAP_S", 0.0)
 
 
-def test_resolve_video_model_routes_by_tier_quality_aspect():
-    """Video model resolver layers fallback: unknown quality → fast,
-    unknown tier → TIER_ONE, unknown aspect → None. So a stale
-    frontend can still dispatch *something* instead of silently
-    swallowing the request."""
-    from flowboard.services.flow_sdk import resolve_video_model
-
-    # Tier 1 fast + landscape
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "fast"
-    ) == "veo_3_1_i2v_s_fast"
-    # Tier 1 fast + portrait → separate model
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_PORTRAIT", "fast"
-    ) == "veo_3_1_i2v_s_fast_portrait"
-    # Tier 2 fast — distinct landscape and portrait models. Both keys
-    # verified against real Flow web request bodies (curl exports from
-    # labs.google Network tab); never speculate suffixes here. Regression
-    # guard for the bug where Tier 2 Portrait Fast was incorrectly mapped
-    # to a landscape-only `_ultra_relaxed` model that ignored aspectRatio
-    # and forced 1280×720 output even when 9:16 was requested.
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_LANDSCAPE", "fast"
-    ) == "veo_3_1_i2v_s_fast_ultra"
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_PORTRAIT", "fast"
-    ) == "veo_3_1_i2v_s_fast_portrait_ultra"
-
-    # Lite — multi-aspect, same key for landscape and portrait. Both
-    # tiers share the `veo_3_1_i2v_lite` checkpoint (verified from PRO
-    # PLAN curl in video_model.md AND ULTRA PLAN curl in
-    # video_model_ultra.md); the per-tier difference is `userPaygateTier`
-    # in clientContext, not the model key.
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_LANDSCAPE", "lite"
-    ) == "veo_3_1_i2v_lite"
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_PORTRAIT", "lite"
-    ) == "veo_3_1_i2v_lite"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "lite"
-    ) == "veo_3_1_i2v_lite"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_PORTRAIT", "lite"
-    ) == "veo_3_1_i2v_lite"
-
-    # Quality — third quality tier (xịn hơn Fast, slower). Both tiers
-    # share the `veo_3_1_i2v_s*` family; the difference is the
-    # `userPaygateTier` in clientContext, not the model key. Landscape
-    # key verified from PRO PLAN curl in video_model.md; portrait key
-    # verified from an Ultra labs.google curl and reused for Pro.
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_LANDSCAPE", "quality"
-    ) == "veo_3_1_i2v_s"
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_PORTRAIT", "quality"
-    ) == "veo_3_1_i2v_s_portrait"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "quality"
-    ) == "veo_3_1_i2v_s"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_PORTRAIT", "quality"
-    ) == "veo_3_1_i2v_s_portrait"
-
-    # Lite Relaxed — Ultra-only 0-credit low-priority queue. Verified
-    # LANDSCAPE key from ULTRA PLAN curl in video_model_ultra.md;
-    # portrait reuses the same key (multi-aspect, same as plain lite).
-    # Tier 1 has no `lite_relaxed` mapping → falls back to Tier 1 fast.
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_LANDSCAPE", "lite_relaxed"
-    ) == "veo_3_1_i2v_lite_low_priority"
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_PORTRAIT", "lite_relaxed"
-    ) == "veo_3_1_i2v_lite_low_priority"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "lite_relaxed"
-    ) == "veo_3_1_i2v_s_fast"
-
-    # Fast Relaxed — Ultra-only 0-credit low-priority queue. Verified
-    # LANDSCAPE key from ULTRA PLAN curl in video_model_ultra.md;
-    # portrait reuses the LANDSCAPE key as best-effort fallback (no
-    # portrait curl observed yet). Tier 1 has no `fast_relaxed` mapping
-    # → falls back to Tier 1 fast.
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_LANDSCAPE", "fast_relaxed"
-    ) == "veo_3_1_i2v_s_fast_ultra_relaxed"
-    assert resolve_video_model(
-        "PAYGATE_TIER_TWO", "VIDEO_ASPECT_RATIO_PORTRAIT", "fast_relaxed"
-    ) == "veo_3_1_i2v_s_fast_ultra_relaxed"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "fast_relaxed"
-    ) == "veo_3_1_i2v_s_fast"
-
-    # Default quality (None / empty) → fast.
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", None
-    ) == "veo_3_1_i2v_s_fast"
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", ""
-    ) == "veo_3_1_i2v_s_fast"
-
-    # Unknown quality → falls back to fast within the tier.
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "VIDEO_ASPECT_RATIO_LANDSCAPE", "ultra"
-    ) == "veo_3_1_i2v_s_fast"
-
-    # Unknown tier → falls back to TIER_ONE.
-    assert resolve_video_model(
-        "PAYGATE_TIER_BOGUS", "VIDEO_ASPECT_RATIO_LANDSCAPE", "fast"
-    ) == "veo_3_1_i2v_s_fast"
-
-    # Unknown aspect → None (caller surfaces a clear error).
-    assert resolve_video_model(
-        "PAYGATE_TIER_ONE", "BOGUS_ASPECT", "fast"
-    ) is None
+# ── create_project ────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_gen_image_empty_media_when_flow_returns_no_media():
-    c = RecordingClient()
-    c.api_response = {"status": 200, "data": {"other": "shape"}}
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_image(prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE")
-    assert out["media_ids"] == []
+async def test_create_project_sends_the_title_and_reads_the_id_back():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_CREATE_PROJECT, [PROJECT, ["Board 1"]])
+    out = await FlowSDK(fake).create_project("Board 1")
+
+    assert out["project_id"] == PROJECT
+    payload = fake.payload_for(fb.RPC_CREATE_PROJECT)
+    assert payload[0] == "projects/*"
+    assert payload[1][1] == ["Board 1"]
+    # No captcha on this call; minting one would spend a single-use token for
+    # nothing and serialise behind the generation calls that need them.
+    assert fake.calls[0]["captcha"] is None
 
 
 @pytest.mark.asyncio
-async def test_gen_image_propagates_extension_error():
-    c = RecordingClient()
-    c.api_response = {"error": "CAPTCHA_FAILED: no tab"}
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_image(prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE")
-    assert out["error"] == "CAPTCHA_FAILED: no tab"
-
-
-def test_extract_project_id_returns_none_on_unexpected_shape():
-    assert _extract_project_id({}) is None
-    assert _extract_project_id({"data": {"result": "oops"}}) is None
-    assert _extract_project_id(None) is None
-
-
-def test_extract_media_ids_filters_non_dicts():
-    assert _extract_media_ids({"data": {"media": [{"name": "a"}, "junk"]}}) == ["a"]
-    assert _extract_media_ids({"data": {}}) == []
-    assert _extract_media_ids("not a dict") == []
-
-
-def test_extract_media_entries_pulls_fife_url():
-    resp = {
-        "data": {
-            "media": [
-                {
-                    "name": "abc123",
-                    "image": {
-                        "generatedImage": {
-                            "fifeUrl": "https://flow-content.google/image/abc123?sig=z",
-                        }
-                    },
-                },
-                {"name": "no-url"},
-            ],
-        },
-    }
-    entries = extract_media_entries(resp)
-    assert len(entries) == 2
-    assert entries[0]["media_id"] == "abc123"
-    assert entries[0]["url"] == "https://flow-content.google/image/abc123?sig=z"
-    assert entries[0]["mediaType"] == "image"
-    assert entries[1]["url"] is None
+async def test_a_project_id_in_an_unexpected_slot_is_a_failure():
+    """A 200 with the id somewhere else is accepted and then silently useless.
+    Scanning the envelope for the first uuid-looking string would "work" right
+    up until it picked a scene id."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_CREATE_PROJECT, [["nested", PROJECT]])
+    out = await FlowSDK(fake).create_project("Board 1")
+    assert "create_project_failed" in out["error"]
 
 
 @pytest.mark.asyncio
-async def test_gen_image_returns_media_entries_with_urls():
-    c = RecordingClient()
-    c.api_response = _make_gen_image_response(["m1", "m2"], with_urls=True)
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_image(prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE")
-    assert out["media_ids"] == ["m1", "m2"]
-    assert len(out["media_entries"]) == 2
-    assert out["media_entries"][0]["url"].startswith("https://flow-content.google/")
+async def test_create_project_falls_back_to_the_pinned_id_and_says_so(monkeypatch):
+    """A board that cannot get a project cannot generate at all, so a pinned
+    `FLOW_PROJECT_ID` is used when Flow refuses. It is reported, because sharing
+    one project between boards is a deliberate choice the user made and a
+    silent one they did not."""
+    monkeypatch.setattr(flow_sdk, "_pinned_project_id", lambda: PROJECT)
+    fake = BatchFakeClient()
+    fake.fail(fb.RPC_CREATE_PROJECT, ["PUBLIC_ERROR_X"])
 
-
-# ── Video gen ───────────────────────────────────────────────────────────────
+    out = await FlowSDK(fake).create_project("Board 1")
+    assert out["project_id"] == PROJECT
+    assert out["pinned_fallback"] is True
 
 
 @pytest.mark.asyncio
-async def test_gen_video_body_shape_and_captcha():
-    c = RecordingClient()
-    c.api_response = {
-        "status": 200,
-        "data": {
-            "operations": [
-                {"operation": {"name": "projects/p/operations/op-xyz"}},
-            ]
-        },
-    }
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="wave in the wind",
-        project_id="proj-1",
-        start_media_id="img-abc",
-        aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
-        paygate_tier="PAYGATE_TIER_ONE",
+async def test_no_pinned_id_means_the_error_survives(monkeypatch):
+    monkeypatch.setattr(flow_sdk, "_pinned_project_id", lambda: None)
+    fake = BatchFakeClient()
+    fake.fail(fb.RPC_CREATE_PROJECT, ["PUBLIC_ERROR_X"])
+    out = await FlowSDK(fake).create_project("Board 1")
+    assert out["error"].startswith("create_project_failed")
+    assert "project_id" not in out
+
+
+@pytest.mark.asyncio
+async def test_a_tool_other_than_pinhole_is_refused_not_silently_defaulted():
+    """The captured payload has no tool slot, so a caller asking for something
+    else would be served the default and told nothing."""
+    fake = BatchFakeClient()
+    out = await FlowSDK(fake).create_project("Board 1", tool="VIDEO_FX")
+    assert out["error"] == "unsupported_on_batch_tool_VIDEO_FX"
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_the_project_listing_is_refused_rather_than_answered_empty():
+    """No RPC for it was captured. An empty list reads as "you have no
+    projects" and invites someone to recreate them all."""
+    sdk = FlowSDK(BatchFakeClient())
+    listed = await sdk.search_user_projects()
+    assert listed["projects"] == []
+    assert listed["error"] == flow_sdk.UNSUPPORTED_PROJECT_LISTING
+    every = await sdk.list_user_projects_all()
+    assert every["error"] == flow_sdk.UNSUPPORTED_PROJECT_LISTING
+
+
+# ── images ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gen_image_sends_prompt_aspect_model_and_a_captcha():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply(MEDIA))
+    out = await FlowSDK(fake).gen_image(
+        prompt="a cat", project_id=PROJECT,
+        aspect_ratio="IMAGE_ASPECT_RATIO_PORTRAIT",
     )
-    assert out["operation_names"] == ["projects/p/operations/op-xyz"]
+    assert out["media_ids"] == [MEDIA]
+    assert out["media_entries"][0]["url"].endswith("?sig=x")
 
-    call = c.api_calls[0]
-    assert call["captcha_action"] == "VIDEO_GENERATION"
-    assert call["url"].endswith("/v1/video:batchAsyncGenerateVideoStartImage")
-    body = call["body"]
-    req0 = body["requests"][0]
-    assert req0["startImage"]["mediaId"] == "img-abc"
-    assert req0["aspectRatio"] == "VIDEO_ASPECT_RATIO_LANDSCAPE"
-    assert req0["videoModelKey"] == "veo_3_1_i2v_s_fast"
-    assert req0["textInput"]["structuredPrompt"]["parts"][0]["text"] == "wave in the wind"
-    assert body["useV2ModelConfig"] is True
+    call = fake.calls_for(fb.RPC_GEN_IMAGE)[0]
+    assert call["captcha"] == fb.CAPTCHA_IMAGE
+    item = fb_item(fake)
+    assert item[8] == [[["a cat"]]]
+    assert item[4] == fb.resolve_aspect("IMAGE_ASPECT_RATIO_PORTRAIT")
+
+
+def fb_item(fake: BatchFakeClient, index: int = 0):
+    """The n-th request item out of an image envelope."""
+    return fake.payload_for(fb.RPC_GEN_IMAGE, index)[1][0]
 
 
 @pytest.mark.asyncio
-async def test_gen_video_batch_with_multiple_start_media_ids():
-    """When the upstream image has N variants, gen_video must dispatch
-    one request_item per source so the batch produces N videos in a
-    single Flow call instead of generating only the first variant."""
-    c = RecordingClient()
-    c.api_response = {
-        "status": 200,
-        "data": {
-            "operations": [
-                {"operation": {"name": "op-1"}},
-                {"operation": {"name": "op-2"}},
-                {"operation": {"name": "op-3"}},
-            ]
-        },
-    }
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="wave",
-        project_id="proj-1",
-        start_media_ids=["src-1", "src-2", "src-3"],
-        aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
-        paygate_tier="PAYGATE_TIER_ONE",
+async def test_gen_image_resolves_the_nickname_to_a_wire_id():
+    """Settings stores `NANO_BANANA_PRO`; Flow only knows `GEM_PIX_2`. Sending
+    the nickname is rejected, and sending an unknown one must not be attempted
+    at all -- `flow_batch` checks it against a closed set."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply(MEDIA))
+    await FlowSDK(fake).gen_image(
+        prompt="a cat", project_id=PROJECT, image_model="NANO_BANANA_2",
     )
-    assert out["operation_names"] == ["op-1", "op-2", "op-3"]
+    assert fb_item(fake)[5] == "NARWHAL"
 
-    body = c.api_calls[0]["body"]
-    items = body["requests"]
-    assert len(items) == 3
-    media_ids = [it["startImage"]["mediaId"] for it in items]
-    assert media_ids == ["src-1", "src-2", "src-3"]
-    # Distinct seeds so Flow doesn't dedupe
-    seeds = [it["seed"] for it in items]
-    assert len(set(seeds)) == 3
+
+def test_an_unknown_image_nickname_falls_back_and_a_bad_wire_id_does_not():
+    """Two different rules, for a reason. Every image model costs the same, so a
+    stale frontend nickname may fall back rather than break dispatch. A wire id
+    is checked against a closed set, so the fallback can never invent one."""
+    assert flow_sdk.resolve_image_model("NO_SUCH_MODEL") == "GEM_PIX_2"
+    with pytest.raises(ValueError):
+        fb.image_request("a cat", PROJECT, model="NO_SUCH_MODEL")
 
 
 @pytest.mark.asyncio
-async def test_gen_video_falls_back_to_single_start_media_id():
-    """Single source still works through the legacy path."""
-    c = RecordingClient()
-    c.api_response = {
-        "status": 200,
-        "data": {"operations": [{"operation": {"name": "op-only"}}]},
-    }
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="x", project_id="p", start_media_id="solo-id",
-        paygate_tier="PAYGATE_TIER_ONE",
+async def test_three_variants_are_three_rpcs_with_three_seeds():
+    """There is no "how many" field. Flow's own composer submits one per
+    variant, each with its own single-use captcha."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply(MEDIA))
+    await FlowSDK(fake).gen_image(prompt="a cat", project_id=PROJECT, variant_count=3)
+
+    calls = fake.calls_for(fb.RPC_GEN_IMAGE)
+    assert len(calls) == 3
+    assert len({fb_item(fake, i)[3] for i in range(3)}) == 3
+
+
+@pytest.mark.asyncio
+async def test_each_variant_can_carry_its_own_prompt():
+    """Four variants as four stances rather than four seeds of one."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply(MEDIA))
+    await FlowSDK(fake).gen_image(
+        prompt="fallback", project_id=PROJECT, variant_count=2,
+        prompts=["standing", "sitting"],
     )
-    assert out["operation_names"] == ["op-only"]
-    items = c.api_calls[0]["body"]["requests"]
-    assert len(items) == 1
-    assert items[0]["startImage"]["mediaId"] == "solo-id"
+    texts = [fb_item(fake, i)[8][0][0][0] for i in range(2)]
+    assert texts == ["standing", "sitting"]
 
 
 @pytest.mark.asyncio
-async def test_gen_video_returns_error_when_no_source_provided():
-    c = RecordingClient()
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(prompt="x", project_id="p", paygate_tier="PAYGATE_TIER_ONE")
-    assert out.get("error") == "missing_start_media_id"
+async def test_a_transient_rejection_retries_once_and_keeps_what_landed():
+    """`[8]` is Flow's generation side refusing under load. Measured upstream:
+    an immediate retry is refused again, so one cooldown and one more attempt.
+    Not a loop -- a retry that keeps going is a retry that keeps paying."""
+    state = {"n": 0}
 
+    def answer(_match):
+        state["n"] += 1
+        # The first variant's first attempt is rejected; everything else lands.
+        if state["n"] == 1:
+            return {"data": json.loads(json.dumps(_rpc_error_body()))}
+        return {"data": envelope(fb.RPC_GEN_IMAGE, image_reply(MEDIA))}
 
-@pytest.mark.asyncio
-async def test_gen_video_rejects_unknown_tier_aspect_combo():
-    c = RecordingClient()
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="x",
-        project_id="p",
-        start_media_id="m",
-        aspect_ratio="VIDEO_ASPECT_RATIO_WEIRD",
-        paygate_tier="PAYGATE_TIER_ONE",
+    fake = BatchFakeClient()
+    fake.responses[fb.RPC_GEN_IMAGE] = answer
+    out = await FlowSDK(fake).gen_image(
+        prompt="a cat", project_id=PROJECT, variant_count=2,
     )
-    assert out["error"].startswith("no_video_model_for_tier")
-    # No HTTP call attempted.
-    assert len(c.api_calls) == 0
+    # Two variants asked for, one rejected then retried: three calls, two images.
+    assert len(fake.calls_for(fb.RPC_GEN_IMAGE)) == 3
+    assert out["media_ids"]
+    assert "partial_error" not in out
+
+
+def _rpc_error_body() -> str:
+    chunk = json.dumps([["wrb.fr", fb.RPC_GEN_IMAGE, None, None, None, [8]]])
+    return f")]}}'\n{len(chunk)}\n{chunk}"
 
 
 @pytest.mark.asyncio
-async def test_gen_video_returns_error_on_no_operations():
-    c = RecordingClient()
-    c.api_response = {"status": 200, "data": {"operations": []}}
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="x", project_id="p", start_media_id="m",
-        paygate_tier="PAYGATE_TIER_ONE",
+async def test_a_partial_wave_keeps_the_images_it_paid_for():
+    """Failing the whole batch to report one bad variant throws away three good
+    ones that have already been charged for."""
+    state = {"n": 0}
+
+    def answer(_match):
+        state["n"] += 1
+        if state["n"] == 1:
+            # A content refusal: terminal, so no retry, and not `[8]`.
+            chunk = json.dumps([
+                ["wrb.fr", fb.RPC_GEN_IMAGE, None, None, None, ["PUBLIC_ERROR_FILTER"]]
+            ])
+            return {"data": f")]}}'\n{len(chunk)}\n{chunk}"}
+        return {"data": envelope(fb.RPC_GEN_IMAGE, image_reply(MEDIA))}
+
+    fake = BatchFakeClient()
+    fake.responses[fb.RPC_GEN_IMAGE] = answer
+    out = await FlowSDK(fake).gen_image(
+        prompt="a cat", project_id=PROJECT, variant_count=2,
     )
-    assert out["error"] == "no_operations_in_response"
+    assert out["media_ids"] == [MEDIA]
+    assert "1/2 variants failed" in out["partial_error"]
 
 
 @pytest.mark.asyncio
-async def test_check_async_marks_done_when_video_meta_has_url():
-    c = RecordingClient()
-    c.api_response = {
-        "status": 200,
-        "data": {
-            "operations": [
-                {
-                    "operation": {
-                        "name": "op-1",
-                        "done": True,
-                        "metadata": {
-                            "video": {
-                                "mediaId": "vid-1",
-                                "fifeUrl": "https://flow-content.google/video/vid-1?sig=x",
-                            }
-                        },
-                    }
-                },
-                {
-                    "operation": {
-                        "name": "op-2",
-                        "metadata": {},  # still pending
-                    }
-                },
-            ]
-        },
-    }
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.check_async(["op-1", "op-2"])
-    ops = out["operations"]
-    assert len(ops) == 2
-    assert ops[0]["done"] is True
-    assert ops[0]["media_entries"][0]["media_id"] == "vid-1"
-    assert ops[0]["media_entries"][0]["url"].startswith("https://flow-content.google/")
-    assert ops[1]["done"] is False
-    assert ops[1]["media_entries"] == []
-
-    # No captcha for poll
-    call = c.api_calls[0]
-    assert "captcha_action" not in call or call["captcha_action"] is None
-    assert call["url"].endswith("/v1/video:batchCheckAsyncVideoGenerationStatus")
+async def test_an_image_reply_with_no_url_is_an_error_not_an_empty_success():
+    """A 200 carrying nothing usable is most often a silent content-filter
+    rejection. Reporting it as zero images made that look like a board with
+    nothing to draw."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, [[None]])
+    out = await FlowSDK(fake).gen_image(prompt="a cat", project_id=PROJECT)
+    assert "image_failed" in out["error"]
 
 
-def test_extract_operation_names_tolerates_missing_inner():
-    resp = {"data": {"operations": [{"name": "top-level-name"}, {"operation": {"name": "inner"}}]}}
-    assert extract_operation_names(resp) == ["top-level-name", "inner"]
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_reported_as_one():
+    """The extension never got to send it, which is a different thing from Flow
+    refusing -- one is fixed in the browser and the other is not."""
+    fake = BatchFakeClient()
+    fake.transport_error(fb.RPC_GEN_IMAGE, "NO_AT_TOKEN")
+    out = await FlowSDK(fake).gen_image(prompt="a cat", project_id=PROJECT)
+    assert "NO_AT_TOKEN" in out["error"]
 
 
-def test_extract_video_operations_handles_missing_and_out_of_order():
-    resp = {
-        "data": {
-            "operations": [
-                {"operation": {"name": "b", "done": True, "metadata": {"video": {"mediaId": "mb", "fifeUrl": "https://flow-content.google/video/mb?x"}}}},
-            ]
-        }
-    }
-    out = extract_video_operations(resp, requested=["a", "b"])
-    assert out[0]["name"] == "a"
-    assert out[0]["done"] is False
-    assert out[1]["name"] == "b"
-    assert out[1]["done"] is True
+@pytest.mark.asyncio
+async def test_edit_image_uses_the_base_image_slot_and_drops_a_duplicate_ref():
+    """Wire type 2 for the source, 1 for references. Flow accepts the wrong
+    slot, ignores it, and charges -- which looks exactly like success."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_IMAGE, image_reply(MEDIA))
+    await FlowSDK(fake).edit_image(
+        prompt="warmer", project_id=PROJECT,
+        source_media_id="src", ref_media_ids=["ref-1", "src"],
+    )
+    inputs = fb_item(fake)[2]
+    assert inputs[0] == ["src", None, None, None, fb.BASE_TYPE_IMAGE]
+    assert inputs[1] == ["ref-1", None, None, None, fb.REF_TYPE_IMAGE]
+    assert len(inputs) == 2, "the source must not also ride as a reference"
 
 
-def test_extract_video_operations_recovers_uuid_from_fife_url():
-    """Flow's video poll response omits ``metadata.video.mediaId`` — it only
-    has ``mediaGenerationId`` (base64 protobuf, NOT UUID). The real UUID is
-    embedded in ``fifeUrl`` as ``/video/<UUID>?...``. Without URL recovery
-    we'd return media_entries=[] for a perfectly-finished video."""
-    resp = {
-        "data": {
-            "operations": [
-                {
-                    "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
-                    "operation": {
-                        "name": "op-1",
-                        "metadata": {
-                            "video": {
-                                "mediaGenerationId": "CAUS-base64-not-a-uuid",
-                                "fifeUrl": "https://flow-content.google/video/f0b6561a-73f2-4360-96aa-35e071aac9ce?Expires=1&Signature=x",
-                            }
-                        },
-                    },
-                },
-            ]
-        }
-    }
-    out = extract_video_operations(resp, requested=["op-1"])
-    assert out[0]["done"] is True
-    assert out[0]["media_entries"] == [
-        {
-            "media_id": "f0b6561a-73f2-4360-96aa-35e071aac9ce",
-            "url": "https://flow-content.google/video/f0b6561a-73f2-4360-96aa-35e071aac9ce?Expires=1&Signature=x",
-            "mediaType": "video",
-        }
+@pytest.mark.asyncio
+async def test_upload_image_carries_a_captcha_which_the_rest_path_did_not():
+    """Worth stating: syncing a dozen references across projects now mints a
+    dozen single-use tokens, which is why the mapping cache is load-bearing."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_UPLOAD_IMAGE, [[MEDIA, PROJECT, "op", "CAE"]])
+    out = await FlowSDK(fake).upload_image("Ym9keQ==", "image/png", PROJECT, "a.png")
+    assert out["media_id"] == MEDIA
+    assert fake.calls_for(fb.RPC_UPLOAD_IMAGE)[0]["captcha"] == fb.CAPTCHA_IMAGE
+
+
+# ── video dispatch ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_gen_video_sends_one_rpc_per_source_and_keeps_their_order():
+    """A four-variant upstream becomes four clips from one call, and the caller
+    pairs slot i of the result with source i."""
+    fake = BatchFakeClient()
+    replies = iter([
+        {"data": envelope(fb.RPC_GEN_VIDEO, operation_reply(f"op-{i}", PROJECT))}
+        for i in range(3)
+    ])
+    fake.responses[fb.RPC_GEN_VIDEO] = lambda _m: next(replies)
+
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT,
+        start_media_ids=["a", "b", "c"],
+        aspect_ratio=LANDSCAPE, video_quality="lite",
+    )
+    assert out["operation_names"] == ["op-0", "op-1", "op-2"]
+    calls = fake.calls_for(fb.RPC_GEN_VIDEO)
+    assert [c["captcha"] for c in calls] == [fb.CAPTCHA_VIDEO] * 3
+    assert ["a" in c["freq"] for c in calls] == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_gen_video_sends_the_lane_key_and_the_aspect_slot():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_VIDEO, operation_reply("op-1", PROJECT))
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT, start_media_id="a",
+        aspect_ratio=PORTRAIT, video_quality="lite_relaxed",
+    )
+    assert out["model_key"] == "veo_3_1_i2v_lite_low_priority"
+    request = fake.payload_for(fb.RPC_GEN_VIDEO)[0][0]
+    assert request[1] == "veo_3_1_i2v_lite_low_priority"
+    # Video aspect is 1=portrait / 2=landscape -- a DIFFERENT encoding from the
+    # image call, which is why it goes through the resolver rather than a copy.
+    assert request[2] == fb.resolve_video_aspect(PORTRAIT)
+
+
+@pytest.mark.asyncio
+async def test_gen_video_falls_back_to_the_single_source_field():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_VIDEO, operation_reply("op-1", PROJECT))
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT, start_media_id="only", video_quality="lite",
+    )
+    assert out["operation_names"] == ["op-1"]
+
+
+@pytest.mark.asyncio
+async def test_gen_video_with_no_source_at_all_is_refused():
+    fake = BatchFakeClient()
+    out = await FlowSDK(fake).gen_video(prompt="move", project_id=PROJECT)
+    assert out["error"] == "missing_start_media_id"
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_failure_midway_carries_out_the_operations_already_created():
+    """The money rule. Each name is a render that is running and charged for, so
+    dropping them on the error path lets the worker re-dispatch a
+    partially-accepted batch and pay twice."""
+    state = {"n": 0}
+
+    def answer(_match):
+        state["n"] += 1
+        if state["n"] <= 2:
+            return {"data": envelope(
+                fb.RPC_GEN_VIDEO, operation_reply(f"op-{state['n']}", PROJECT)
+            )}
+        return {"error": "NO_INJECTION_RESULT"}
+
+    fake = BatchFakeClient()
+    fake.responses[fb.RPC_GEN_VIDEO] = answer
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT,
+        start_media_ids=["a", "b", "c"], video_quality="lite",
+    )
+    assert out["error"]
+    assert out["operation_names"] == ["op-1", "op-2"]
+
+
+@pytest.mark.asyncio
+async def test_the_omni_lane_on_image_to_video_sends_omni_and_its_duration():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_VIDEO, operation_reply("op-1", PROJECT))
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT, start_media_id="a",
+        video_quality="omni", duration_s=4,
+    )
+    assert out["model_key"] == "abra_i2v_4s"
+    assert "abra_i2v_4s" in fake.calls_for(fb.RPC_GEN_VIDEO)[0]["freq"]
+
+
+@pytest.mark.asyncio
+async def test_the_substitution_channel_stays_wired_and_empty():
+    """`jobs.ts` reads `model_substitutions` to warn about a lane swap. This
+    build refuses instead of swapping, so the list is always empty -- asserted
+    rather than assumed, because a swap arriving here silently is the failure."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_VIDEO, operation_reply("op-1", PROJECT))
+    out = await FlowSDK(fake).gen_video(
+        prompt="move", project_id=PROJECT, start_media_id="a", video_quality="fast",
+    )
+    assert out["model_substitutions"] == []
+
+
+# ── the three-signal poll ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_finished_clip_needs_all_three_signals():
+    """The operation says it is done, the listing hands over the media id, and
+    the media record grows a `/video/` url. Only then is it downloadable."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_GEN_VIDEO, operation_reply("op-1", PROJECT))
+    sdk = FlowSDK(fake)
+    await sdk.gen_video(
+        prompt="move", project_id=PROJECT, start_media_id="a", video_quality="lite",
+    )
+
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status="CAE"))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
+
+    round_one = await sdk.check_async(["op-1"])
+    op = round_one["operations"][0]
+    assert op["done"] is True
+    assert op["status"] == "MEDIA_GENERATION_STATUS_SUCCESSFUL"
+    assert op["media_entries"] == [
+        {"media_id": MEDIA, "url": f"https://{fb.MEDIA_HOST}/video/{MEDIA}?s=1",
+         "mediaType": "video"}
     ]
 
 
-def test_extract_video_operations_surfaces_per_op_failure():
-    """A real Flow rejection mid-poll: status FAILED at the envelope, plus
-    ``operation.error.message: PUBLIC_ERROR_AUDIO_FILTERED`` on the inner
-    object. Old code only checked SUCCESSFUL → spent the full 7-min timeout
-    polling a doomed op. Worker now treats `error` as terminal."""
-    resp = {
-        "data": {
-            "operations": [
-                {
-                    "status": "MEDIA_GENERATION_STATUS_FAILED",
-                    "operation": {
-                        "name": "vid-bad",
-                        "error": {"code": 3, "message": "PUBLIC_ERROR_AUDIO_FILTERED"},
-                    },
-                },
-            ]
-        }
-    }
-    out = extract_video_operations(resp, requested=["vid-bad"])
-    assert out[0]["done"] is True
-    assert out[0]["error"] == "PUBLIC_ERROR_AUDIO_FILTERED"
-    # No media_entries should be attached when the op itself errored.
-    assert out[0]["media_entries"] == []
+@pytest.mark.asyncio
+async def test_the_listing_is_always_asked_with_a_match_window():
+    """That payload is past 17 MB and grows with every generation, so anything
+    shipping it whole gets truncated and loses roughly half of all lookups."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status="CAE"))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
 
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    await sdk.check_async(["op-1"])
 
-def test_extract_video_operations_recognizes_status_successful_envelope():
-    """Flow returns operation status at the *outer* envelope level
-    (op["status"]), not on the inner operation. Older code only checked
-    inner.done and missed legitimately-completed videos."""
-    resp = {
-        "data": {
-            "operations": [
-                {
-                    "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
-                    "operation": {
-                        "name": "vid-ok",
-                        "metadata": {"video": {"mediaId": "abc-123", "fifeUrl": "https://flow-content.google/video/abc?sig"}},
-                    },
-                },
-                {
-                    "status": "MEDIA_GENERATION_STATUS_PENDING",
-                    "operation": {"name": "vid-pending"},
-                },
-            ]
-        }
-    }
-    out = extract_video_operations(resp, requested=["vid-ok", "vid-pending"])
-    assert out[0]["done"] is True
-    assert out[0]["media_entries"] == [
-        {"media_id": "abc-123", "url": "https://flow-content.google/video/abc?sig", "mediaType": "video"}
-    ]
-    assert out[1]["done"] is False
-    assert out[1]["media_entries"] == []
-
-
-def test_extract_inner_api_error_returns_none_on_success():
-    assert _extract_inner_api_error({"status": 200, "data": {"media": []}}) is None
-    assert _extract_inner_api_error({"data": {"operations": [{"x": 1}]}}) is None
-    assert _extract_inner_api_error("not a dict") is None
-
-
-def test_extract_inner_api_error_surfaces_prominent_people_filter():
-    """Real Flow rejection: status 400 + INVALID_ARGUMENT with the content
-    filter reason. Worker must see this so it doesn't mark the request done
-    with media_ids=[]."""
-    resp = {
-        "id": "abc",
-        "status": 400,
-        "data": {
-            "error": {
-                "code": 400,
-                "message": "Request contains an invalid argument.",
-                "status": "INVALID_ARGUMENT",
-                "details": [
-                    {
-                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                        "reason": "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED",
-                    }
-                ],
-            }
-        },
-    }
-    err = _extract_inner_api_error(resp)
-    assert err is not None
-    assert "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in err
-    assert "invalid argument" in err.lower()
-
-
-def test_extract_inner_api_error_handles_status_only():
-    """status >= 400 with no structured error body → still report failure."""
-    err = _extract_inner_api_error({"status": 503, "data": {}})
-    assert err == "API_503"
-
-
-# ── workflow-mode (Low Priority) video schema ─────────────────────────────
-# Some Veo checkpoints (e.g. ``veo_3_1_i2v_lite_low_priority``,
-# ``veo_3_1_i2v_s_fast_ultra_relaxed``) return ``data.workflows[]`` instead
-# of ``data.operations[]``, and the final MP4 is fetched inline as base64
-# from ``/v1/media/<id>`` rather than streamed off ``fifeUrl``. The SDK
-# auto-detects the schema and routes the poll accordingly.
-
-
-def _mp4_bytes(size: int = 64) -> bytes:
-    """Synthetic but valid-looking MP4: ``ftyp`` box at offset 4 (12+ bytes)."""
-    header = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
-    return header + b"\x00" * (size - len(header))
-
-
-def test_extract_operation_names_handles_workflow_schema():
-    """NEW Low Priority schema — ``workflows[]`` instead of ``operations[]``."""
-    resp = {
-        "data": {
-            "workflows": [
-                {"name": "wf-1", "metadata": {"primaryMediaId": "mid-1"}},
-                {"name": "wf-2", "metadata": {"primaryMediaId": "mid-2"}},
-            ]
-        }
-    }
-    assert extract_operation_names(resp) == ["wf-1", "wf-2"]
-
-
-def test_extract_video_workflows_returns_pairs():
-    resp = {
-        "data": {
-            "workflows": [
-                {"name": "wf-1", "metadata": {"primaryMediaId": "mid-1"}},
-                {"name": "wf-orphan", "metadata": {}},  # no primary → dropped
-                {"name": "wf-2", "metadata": {"primaryMediaId": "mid-2"}},
-            ]
-        }
-    }
-    assert extract_video_workflows(resp) == [
-        {"name": "wf-1", "primary_media_id": "mid-1"},
-        {"name": "wf-2", "primary_media_id": "mid-2"},
-    ]
-
-
-def test_extract_video_workflows_empty_on_old_schema():
-    """OLD operations-based schema must not be confused with workflow mode."""
-    resp = {"data": {"operations": [{"operation": {"name": "op-1"}}]}}
-    assert extract_video_workflows(resp) == []
+    listing = fake.calls_for(fb.RPC_PROJECT_MEDIA)
+    assert listing, "the listing was never consulted"
+    assert all(c["match"] == "op-1" for c in listing)
 
 
 @pytest.mark.asyncio
-async def test_gen_video_surfaces_workflows_on_low_priority_response():
-    c = RecordingClient()
-    c.api_response = {
-        "status": 200,
-        "data": {
-            "workflows": [
-                {"name": "wf-uuid", "metadata": {"primaryMediaId": "primary-vid-1"}},
-            ],
-            "media": [{"name": "primary-vid-1"}],
-        },
-    }
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.gen_video(
-        prompt="x", project_id="p", start_media_id="src",
-        paygate_tier="PAYGATE_TIER_TWO", video_quality="lite_relaxed",
+async def test_a_poster_only_record_is_pending_not_done():
+    """Flow serves the still before the clip exists. Downloading on the id alone
+    saves a picture -- that was a real bug, not a hypothetical."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status="CAE"))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA, video=False))
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    op = (await sdk.check_async(["op-1"]))["operations"][0]
+    assert op["done"] is False
+    assert op["media_entries"] == []
+    assert op["media_id"] == MEDIA, "found-but-rendering must be distinguishable"
+
+
+@pytest.mark.asyncio
+async def test_a_media_not_found_complaint_is_a_diagnosis_not_a_failure():
+    """Measured: an operation can say exactly that and still deliver a finished
+    eight-second clip. Reading it as terminal abandoned paid renders."""
+    fake = BatchFakeClient()
+    fake.reply(
+        fb.RPC_OPERATION,
+        operation_reply("op-1", PROJECT, complaint="Media not found."),
     )
-    assert out["operation_names"] == ["wf-uuid"]
-    assert out["workflows"] == [{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}]
-    # Old "no_operations_in_response" path must NOT trigger on workflow shape.
-    assert "error" not in out
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    op = (await sdk.check_async(["op-1"]))["operations"][0]
+    assert op["done"] is True
+    assert op["error"] is None
 
 
 @pytest.mark.asyncio
-async def test_check_async_workflow_mode_polls_media_endpoint():
-    """Workflow polling fetches ``/v1/media/<id>`` and reads base64 MP4 off
-    ``video.encodedVideo``. A response with valid ``ftyp`` magic → done."""
-    import base64 as _b64
-
-    class WorkflowClient(RecordingClient):
-        async def api_request(self, **kwargs):
-            self.api_calls.append(kwargs)
-            return {
-                "status": 200,
-                "data": {
-                    "video": {
-                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
-                        "fifeUrl": "https://flow-content.google/video/primary-vid-1?sig=x",
-                    }
-                },
-            }
-
-    c = WorkflowClient()
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.check_async(
-        ["wf-uuid"],
-        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+async def test_the_complaint_rides_out_under_its_own_key_while_pending():
+    """Not as `error`, which the worker treats as terminal."""
+    fake = BatchFakeClient()
+    fake.reply(
+        fb.RPC_OPERATION,
+        operation_reply("op-1", PROJECT, complaint="Media not found."),
     )
-    ops = out["operations"]
-    assert len(ops) == 1
-    assert ops[0]["name"] == "wf-uuid"
-    assert ops[0]["done"] is True
-    assert ops[0]["media_entries"][0]["media_id"] == "primary-vid-1"
-    assert ops[0]["media_entries"][0]["mediaType"] == "video"
-    # The encoded video bytes ride along so the processor can plant them
-    # in the local cache (no GCS URL to fall back to).
-    assert "encoded_video" in ops[0]["media_entries"][0]
-    # GET against /v1/media/<id> — never POST batchCheckAsync for a workflow.
-    assert c.api_calls[0]["method"] == "GET"
-    assert "/v1/media/primary-vid-1" in c.api_calls[0]["url"]
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", None)
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    op = (await sdk.check_async(["op-1"]))["operations"][0]
+    assert op["done"] is False
+    assert op["error"] is None
+    assert op["complaint"] == "Media not found."
 
 
 @pytest.mark.asyncio
-async def test_check_async_workflow_mode_partial_bytes_means_pending():
-    """During render Flow returns a small metadata payload (no ``ftyp``
-    magic). That must register as ``done=False`` so the worker keeps
-    polling — not a spurious success on a 0-byte file."""
-    import base64 as _b64
+async def test_the_expensive_listing_is_skipped_on_a_quiet_round():
+    """It is the authority and the 17 MB call, so it is consulted when the
+    operation reports something, when the poll is unreadable, or every third
+    round regardless -- not on every round of a job that is plainly running."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status=None))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", None)
 
-    class WorkflowClient(RecordingClient):
-        async def api_request(self, **kwargs):
-            self.api_calls.append(kwargs)
-            return {
-                "status": 200,
-                "data": {
-                    "video": {"encodedVideo": _b64.b64encode(b"\x00" * 200).decode()}
-                },
-            }
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    await sdk.check_async(["op-1"])
+    await sdk.check_async(["op-1"])
+    assert fake.calls_for(fb.RPC_PROJECT_MEDIA) == []
+    await sdk.check_async(["op-1"])
+    assert len(fake.calls_for(fb.RPC_PROJECT_MEDIA)) == 1
 
-    c = WorkflowClient()
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
-    out = await sdk.check_async(
-        ["wf-uuid"],
-        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+
+@pytest.mark.asyncio
+async def test_an_unreadable_operation_poll_sends_us_to_the_listing():
+    """An operation that decayed to a bare id still shows up there, so a failed
+    poll is a reason to look rather than to stop."""
+    fake = BatchFakeClient()
+    fake.transport_error(fb.RPC_OPERATION, "NO_INJECTION_RESULT")
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    op = (await sdk.check_async(["op-1"]))["operations"][0]
+    assert op["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_with_no_project_known_the_operation_poll_is_the_fallback():
+    """Nothing to look the media up in, so the round reports pending with the
+    reason rather than raising."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", None, status="CAE"))
+
+    op = (await FlowSDK(fake).check_async(["op-1"]))["operations"][0]
+    assert op["done"] is False
+    assert "project id" in (op.get("complaint") or "")
+    assert fake.calls_for(fb.RPC_PROJECT_MEDIA) == []
+
+
+@pytest.mark.asyncio
+async def test_the_media_id_is_remembered_so_the_listing_is_asked_once():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status="CAE"))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA, video=False))
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
+    await sdk.check_async(["op-1"])
+    await sdk.check_async(["op-1"])
+    assert len(fake.calls_for(fb.RPC_PROJECT_MEDIA)) == 1
+    assert len(fake.calls_for(fb.RPC_MEDIA)) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_results_come_back_in_the_order_asked_for():
+    """Slot i of the answer pairs with source i on the caller's side."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-b", PROJECT))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-b", None)
+
+    out = await FlowSDK(fake).check_async(["op-a", "op-b", "op-c"])
+    assert [o["name"] for o in out["operations"]] == ["op-a", "op-b", "op-c"]
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_is_polled_through_the_media_record_not_the_operation():
+    """Text-to-video submits never had operation handles."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
+
+    out = await FlowSDK(fake).check_async(
+        ["wf-1"], workflows=[{"name": "wf-1", "primary_media_id": MEDIA}]
+    )
+    op = out["operations"][0]
+    assert op["done"] is True
+    assert op["media_entries"][0]["media_id"] == MEDIA
+    assert fake.calls_for(fb.RPC_OPERATION) == []
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_with_only_a_poster_is_still_pending():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA, video=False))
+    out = await FlowSDK(fake).check_async(
+        ["wf-1"], workflows=[{"name": "wf-1", "primary_media_id": MEDIA}]
     )
     assert out["operations"][0]["done"] is False
-    assert out["operations"][0]["media_entries"] == []
 
 
 @pytest.mark.asyncio
-async def test_check_async_mixed_schemas_routes_correctly():
-    """A single batch can mix OLD operations and NEW workflows (e.g. when a
-    retry of a workflow op is re-dispatched as workflow). Operation names
-    must NOT be sent into the workflow poll and vice-versa."""
-    import base64 as _b64
+async def test_operations_and_workflows_in_one_round_route_separately():
+    """A board can hold both, and the caller cannot tell them apart."""
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_OPERATION, operation_reply("op-1", PROJECT, status="CAE"))
+    fake.responses[fb.RPC_PROJECT_MEDIA] = listing_window("op-1", MEDIA)
 
-    class MixedClient(RecordingClient):
-        async def api_request(self, **kwargs):
-            self.api_calls.append(kwargs)
-            url = kwargs.get("url", "")
-            if "batchCheckAsync" in url:
-                return {
-                    "status": 200,
-                    "data": {
-                        "operations": [
-                            {
-                                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
-                                "operation": {
-                                    "name": "op-old",
-                                    "metadata": {"video": {"mediaId": "old-mid", "fifeUrl": "https://flow-content.google/video/old-mid?sig"}},
-                                },
-                            }
-                        ]
-                    },
-                }
-            # /v1/media/<id> path
-            return {
-                "status": 200,
-                "data": {
-                    "video": {
-                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
-                        "fifeUrl": "https://flow-content.google/video/wf-mid?sig",
-                    }
-                },
-            }
+    def media(_match):
+        return {"data": envelope(fb.RPC_MEDIA, media_reply(MEDIA))}
 
-    c = MixedClient()
-    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    fake.responses[fb.RPC_MEDIA] = media
+
+    sdk = FlowSDK(fake)
+    sdk._remember_operation("op-1", PROJECT)
     out = await sdk.check_async(
-        ["op-old", "wf-uuid"],
-        workflows=[{"name": "wf-uuid", "primary_media_id": "wf-mid"}],
+        ["op-1", "wf-1"],
+        workflows=[{"name": "wf-1", "primary_media_id": OTHER_MEDIA}],
     )
-    ops = out["operations"]
-    # Result preserves the input order, not the dispatch order.
-    assert [o["name"] for o in ops] == ["op-old", "wf-uuid"]
-    assert ops[0]["done"] is True
-    assert ops[1]["done"] is True
-    # OLD poll body must only include op-old (workflow uuid → would 400 on Flow).
-    old_call = next(c for c in c.api_calls if "batchCheckAsync" in c.get("url", ""))
-    bodies = old_call["body"]["operations"]
-    assert [b["operation"]["name"] for b in bodies] == ["op-old"]
+    assert [o["name"] for o in out["operations"]] == ["op-1", "wf-1"]
+    assert all(o["done"] for o in out["operations"])
 
 
 @pytest.mark.asyncio
-async def test_gen_image_propagates_prominent_people_filter():
-    """Without the inner-error check, gen_image returned ``media_ids: []``
-    on a content-filter rejection — worker then marked it `done` instead of
-    `failed`. Verify the SDK surfaces an `error` key for the worker."""
-    client = RecordingClient()
-    client.api_response = {
-        "id": "x",
-        "status": 400,
-        "data": {
-            "error": {
-                "status": "INVALID_ARGUMENT",
-                "message": "Request contains an invalid argument.",
-                "details": [
-                    {"reason": "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED"}
-                ],
-            }
-        },
-    }
-    sdk = FlowSDK(client)
-    out = await sdk.gen_image(
-        prompt="x", project_id="abcd1234", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
-        paygate_tier="PAYGATE_TIER_ONE",
+async def test_one_bad_operation_does_not_fail_the_whole_round():
+    """Every other clip in the batch is still rendering and still paid for."""
+    def operation(_match):
+        raise RuntimeError("boom")
+
+    fake = BatchFakeClient()
+    fake.responses[fb.RPC_OPERATION] = operation
+    out = await FlowSDK(fake).check_async(["op-1"])
+    assert out["operations"][0]["done"] is False
+
+
+# ── media urls ────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_media_download_url_prefers_the_clip_over_the_poster():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_MEDIA, media_reply(MEDIA))
+    url = await FlowSDK(fake).media_download_url(MEDIA)
+    assert "/video/" in url
+
+
+@pytest.mark.asyncio
+async def test_media_download_url_is_none_when_nothing_is_ready():
+    fake = BatchFakeClient()
+    fake.reply(fb.RPC_MEDIA, [])
+    assert await FlowSDK(fake).media_download_url(MEDIA) is None
+    assert await FlowSDK(fake).media_download_url("") is None
+
+
+# ── the worker's half of the money rule ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_worker_refuses_to_retry_a_partially_accepted_batch(client):
+    """A result naming operations is a render already charged for. The retry
+    gate reads the names out of the result, which is why the SDK carries them
+    out on the error path."""
+    from flowboard.worker.processor import WorkerController
+
+    w = WorkerController()
+    row = client.post("/api/requests", json={
+        "type": "gen_video",
+        "params": {"prompt": "x", "project_id": PROJECT},
+    }).json()
+
+    from flowboard.db import get_session
+    from flowboard.db.models import Request
+
+    with get_session() as s:
+        req = s.get(Request, row["id"])
+        req.result = {"operation_names": ["op-1", "op-2"]}
+        s.add(req)
+        s.commit()
+        s.refresh(req)
+
+        # `NO_INJECTION_RESULT` is in the "free" bucket -- normally retried
+        # without burning the attempt budget, because it is a browser-side
+        # hiccup and costs nothing. Naming operations overrides that: the
+        # renders are running and charged for.
+        from flowboard.worker.processor import classify_error
+
+        assert classify_error("NO_INJECTION_RESULT", request_type=req.type) == "free"
+        w._apply_failure(req, "NO_INJECTION_RESULT", req.result)
+        # Read the object, not a refreshed row: `_apply_failure` mutates and the
+        # caller commits, so refreshing here would reload the pre-call status
+        # and the assertion would pass for the wrong reason.
+        assert req.status == "failed", "a charged batch must not be re-dispatched"
+        assert req.free_retries == 0
+
+
+# ── what an error looks like by the time a person reads it ────────────
+
+
+LIVE_DENIED = [
+    7, None,
+    [["type.googleapis.com/google.rpc.ErrorInfo", ["PUBLIC_ERROR_MODEL_ACCESS_DENIED"]]],
+]
+
+
+def test_flows_own_code_leads_the_error_string():
+    """Captured live on a Pro account 19/09/2026 by asking for the free lane.
+
+    Before this, the string was `RpcError: eb1hJf failed: [7, None,
+    [['type.googleapis.com/google.rpc.ErrorInfo', [...]]]]` — the same
+    information, unreadable, and it is the error a Pro user hits most often
+    because the UI marks that lane free and invites them to pick it.
+    """
+    text = flow_sdk._error_text(fb.RpcError("eb1hJf", LIVE_DENIED))
+    assert text.startswith("PUBLIC_ERROR_MODEL_ACCESS_DENIED")
+    # The rpcid survives for a bug report, but after the part a person reads.
+    assert "eb1hJf" in text
+    assert "googleapis.com" not in text
+
+
+def test_the_string_a_person_reads_is_the_string_the_worker_classifies():
+    """One string, not two. The retry policy and the message used to be able to
+    disagree, because the tests for each wrote their own example."""
+    from flowboard.worker.processor import classify_error
+
+    denied = flow_sdk._error_text(fb.RpcError("eb1hJf", LIVE_DENIED))
+    assert classify_error(denied) == "terminal"
+
+    replayed = flow_sdk._error_text(
+        fb.RpcError("ogiZ0b", [7, None, [["x", ["PUBLIC_ERROR_UNUSUAL_ACTIVITY"]]]])
     )
-    assert "error" in out
-    assert "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in out["error"]
-    assert "media_ids" not in out
+    # The trap: `PUBLIC_ERROR_` is a self-terminal prefix, so leading with the
+    # clean code would have made a re-mintable captcha failure terminal.
+    assert classify_error(replayed) == "captcha"
+
+    transient = flow_sdk._error_text(fb.RpcError("ogiZ0b", [8]))
+    assert classify_error(transient) == "counted"
+
+
+def test_an_error_with_no_flow_code_still_names_the_layer_that_refused():
+    """No guessing when the detail carries no reason: the exception type at
+    least says whether the bridge or Flow said no."""
+    text = flow_sdk._error_text(fb.RpcError("as29s", ["something unmapped"]))
+    assert text.startswith("RpcError")
+    assert "as29s" in text
+
+
+@pytest.mark.asyncio
+async def test_a_partial_wave_keeps_flows_code_inside_the_truncation():
+    """The sentence under a partly-failed image node has to survive its own cut.
+
+    The image paths built error strings from `str(exc)`, so a `[7]` arrived as a
+    repr of a nested protobuf — `ogiZ0b failed: [7, None, [['type.googleapis.com/
+    google.rpc.ErrorInfo', ['PUBLIC_...` — and the 80-character slice in
+    `partial_error` landed in the middle of the code. The one actionable token was
+    cut off, and `errorLabel` had nothing to translate.
+
+    The video paths already led with the code through `_error_text`; the
+    most-used node type in the app did not.
+    """
+    state = {"n": 0}
+
+    def answer(_match):
+        state["n"] += 1
+        if state["n"] == 1:
+            # The live `[7]` shape: three slots, with the code nested inside.
+            chunk = json.dumps([[
+                "wrb.fr", fb.RPC_GEN_IMAGE, None, None, None,
+                [7, None, [["type.googleapis.com/google.rpc.ErrorInfo",
+                            ["PUBLIC_ERROR_MODEL_ACCESS_DENIED"]]]],
+            ]])
+            return {"data": f")]}}'\n{len(chunk)}\n{chunk}"}
+        return {"data": envelope(fb.RPC_GEN_IMAGE, image_reply(MEDIA))}
+
+    fake = BatchFakeClient()
+    fake.responses[fb.RPC_GEN_IMAGE] = answer
+    out = await FlowSDK(fake).gen_image(
+        prompt="a cat", project_id=PROJECT, variant_count=2,
+    )
+    assert out["media_ids"] == [MEDIA]
+    assert "PUBLIC_ERROR_MODEL_ACCESS_DENIED" in out["partial_error"]

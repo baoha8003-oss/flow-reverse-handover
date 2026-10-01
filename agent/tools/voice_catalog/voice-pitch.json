@@ -1,0 +1,398 @@
+{
+ "gemini": {
+  "Achernar": {
+   "f0": 200.0,
+   "voiced": 39
+  },
+  "Achird": {
+   "f0": 162.4,
+   "voiced": 28
+  },
+  "Algenib": {
+   "f0": 95.0,
+   "voiced": 48
+  },
+  "Algieba": {
+   "f0": 99.1,
+   "voiced": 58
+  },
+  "Alnilam": {
+   "f0": 132.2,
+   "voiced": 40
+  },
+  "Aoede": {
+   "f0": 181.9,
+   "voiced": 38
+  },
+  "Autonoe": {
+   "f0": 179.8,
+   "voiced": 55
+  },
+  "Callirrhoe": {
+   "f0": 152.4,
+   "voiced": 43
+  },
+  "Charon": {
+   "f0": 168.4,
+   "voiced": 27
+  },
+  "Despina": {
+   "f0": 271.2,
+   "voiced": 28
+  },
+  "Enceladus": {
+   "f0": 124.5,
+   "voiced": 52
+  },
+  "Erinome": {
+   "f0": 176.8,
+   "voiced": 54
+  },
+  "Fenrir": {
+   "f0": 145.5,
+   "voiced": 17
+  },
+  "Gacrux": {
+   "f0": 207.8,
+   "voiced": 31
+  },
+  "Iapetus": {
+   "f0": 167.5,
+   "voiced": 40
+  },
+  "Kore": {
+   "f0": 254.0,
+   "voiced": 36
+  },
+  "Laomedeia": {
+   "f0": 242.4,
+   "voiced": 57
+  },
+  "Leda": {
+   "f0": 177.8,
+   "voiced": 53
+  },
+  "Orus": {
+   "f0": 134.5,
+   "voiced": 35
+  },
+  "Puck": {
+   "f0": 110.3,
+   "voiced": 27
+  },
+  "Pulcherrima": {
+   "f0": 168.4,
+   "voiced": 40
+  },
+  "Rasalgethi": {
+   "f0": 148.1,
+   "voiced": 43
+  },
+  "Sadachbia": {
+   "f0": 146.8,
+   "voiced": 27
+  },
+  "Sadaltager": {
+   "f0": 168.4,
+   "voiced": 42
+  },
+  "Schedar": {
+   "f0": 125.0,
+   "voiced": 25
+  },
+  "Sulafat": {
+   "f0": 222.2,
+   "voiced": 64
+  },
+  "Umbriel": {
+   "f0": 130.1,
+   "voiced": 28
+  },
+  "Vindemiatrix": {
+   "f0": 175.8,
+   "voiced": 39
+  },
+  "Zephyr": {
+   "f0": 225.4,
+   "voiced": 43
+  },
+  "Zubenelgenubi": {
+   "f0": 139.1,
+   "voiced": 51
+  }
+ },
+ "gpt": {
+  "breeze": {
+   "f0": 168.4,
+   "voiced": 107
+  },
+  "cove": {
+   "f0": 91.2,
+   "voiced": 84
+  },
+  "ember": {
+   "f0": 113.5,
+   "voiced": 75
+  },
+  "fathom": {
+   "f0": 105.6,
+   "voiced": 94
+  },
+  "glimmer": {
+   "f0": 192.8,
+   "voiced": 106
+  },
+  "juniper": {
+   "f0": 192.8,
+   "voiced": 108
+  },
+  "maple": {
+   "f0": 202.5,
+   "voiced": 90
+  },
+  "orbit": {
+   "f0": 101.9,
+   "voiced": 99
+  },
+  "vale": {
+   "f0": 160.0,
+   "voiced": 108
+  }
+ },
+ "capcut_vi": {
+  "Alex Đại Đế": {
+   "f0": 164.9,
+   "voiced": 97
+  },
+  "Ban Mai": {
+   "f0": 210.5,
+   "voiced": 133
+  },
+  "Bản Tin 1": {
+   "f0": 216.2,
+   "voiced": 113
+  },
+  "Bản Tin nữ": {
+   "f0": 209.2,
+   "voiced": 118
+  },
+  "Cô Gái Hoạt Ngôn": {
+   "f0": 242.4,
+   "voiced": 105
+  },
+  "Giọng Bé": {
+   "f0": 290.9,
+   "voiced": 105
+  },
+  "Giọng Gái Mới Lớn": {
+   "f0": 266.7,
+   "voiced": 126
+  },
+  "Giọng Nam Trầm": {
+   "f0": 152.4,
+   "voiced": 107
+  },
+  "Giọng Nữ Phổ Thông": {
+   "f0": 200.0,
+   "voiced": 121
+  },
+  "Kenny Đại Đế": {
+   "f0": 120.3,
+   "voiced": 101
+  },
+  "Mai": {
+   "f0": 256.0,
+   "voiced": 106
+  },
+  "Nam bản tin": {
+   "f0": 238.8,
+   "voiced": 121
+  },
+  "Nhỏ Ngọt Ngào": {
+   "f0": 246.2,
+   "voiced": 106
+  },
+  "Quên Tên Tự Test": {
+   "f0": 248.1,
+   "voiced": 116
+  },
+  "Review Phim 2": {
+   "f0": 242.4,
+   "voiced": 115
+  },
+  "Review Phim 3": {
+   "f0": 213.3,
+   "voiced": 120
+  },
+  "Review Phim 4": {
+   "f0": 225.4,
+   "voiced": 118
+  },
+  "Review Phim new": {
+   "f0": 201.3,
+   "voiced": 152
+  },
+  "Robot VN": {
+   "f0": 163.3,
+   "voiced": 87
+  },
+  "Sunny Idol": {
+   "f0": 228.6,
+   "voiced": 126
+  },
+  "Thanh Niên Tự Tin": {
+   "f0": 155.3,
+   "voiced": 103
+  },
+  "Việt Méo": {
+   "f0": 158.4,
+   "voiced": 90
+  }
+ },
+ "capcut_en": {
+  "American Female": {
+   "f0": 225.4,
+   "voiced": 162
+  },
+  "Artist": {
+   "f0": 254.0,
+   "voiced": 186
+  },
+  "Bluetooth": {
+   "f0": 192.8,
+   "voiced": 145
+  },
+  "BrianJW": {
+   "f0": 175.8,
+   "voiced": 105
+  },
+  "Captain": {
+   "f0": 307.7,
+   "voiced": 135
+  },
+  "Chrming Male": {
+   "f0": 165.0,
+   "voiced": 114
+  },
+  "Classical Music": {
+   "f0": 301.9,
+   "voiced": 264
+  },
+  "Creepy female": {
+   "f0": 235.3,
+   "voiced": 120
+  },
+  "Cute Boy": {
+   "f0": 313.7,
+   "voiced": 144
+  },
+  "Cute Girl": {
+   "f0": 275.9,
+   "voiced": 123
+  },
+  "Daiana": {
+   "f0": 197.5,
+   "voiced": 143
+  },
+  "Deadpool": {
+   "f0": 118.5,
+   "voiced": 121
+  },
+  "Dolly famle": {
+   "f0": 280.7,
+   "voiced": 153
+  },
+  "Dramaaa": {
+   "f0": 195.1,
+   "voiced": 131
+  },
+  "Emotional": {
+   "f0": 213.3,
+   "voiced": 118
+  },
+  "EN US 2": {
+   "f0": 175.8,
+   "voiced": 129
+  },
+  "EN US": {
+   "f0": 290.9,
+   "voiced": 159
+  },
+  "Energetic Famale": {
+   "f0": 271.2,
+   "voiced": 145
+  },
+  "English": {
+   "f0": 128.0,
+   "voiced": 117
+  },
+  "Excited": {
+   "f0": 258.1,
+   "voiced": 131
+  },
+  "Female Teacher": {
+   "f0": 195.1,
+   "voiced": 137
+  },
+  "Grim Rock": {
+   "f0": 216.2,
+   "voiced": 376
+  },
+  "Janeamber": {
+   "f0": 222.2,
+   "voiced": 133
+  },
+  "Jessie": {
+   "f0": 248.1,
+   "voiced": 152
+  },
+  "Kai": {
+   "f0": 146.1,
+   "voiced": 112
+  },
+  "Lisa": {
+   "f0": 113.5,
+   "voiced": 154
+  },
+  "Male Profess": {
+   "f0": 105.3,
+   "voiced": 103
+  },
+  "Mentor": {
+   "f0": 122.1,
+   "voiced": 129
+  },
+  "Mischief": {
+   "f0": 219.2,
+   "voiced": 136
+  },
+  "Narrator": {
+   "f0": 120.3,
+   "voiced": 73
+  },
+  "Oogie": {
+   "f0": 222.2,
+   "voiced": 147
+  },
+  "Robaa": {
+   "f0": 197.5,
+   "voiced": 180
+  },
+  "Sherry": {
+   "f0": 213.3,
+   "voiced": 128
+  },
+  "Suaraaa": {
+   "f0": 262.3,
+   "voiced": 153
+  },
+  "Tinn": {
+   "f0": 222.2,
+   "voiced": 127
+  },
+  "Trickster": {
+   "f0": 142.9,
+   "voiced": 134
+  }
+ }
+}

@@ -42,23 +42,28 @@ def _envelope(result_text: str, is_error: bool = False) -> bytes:
 
 
 def _stub_run(monkeypatch, returns):
+    """Stub the CLI at `run_cli`, the seam the provider now goes through.
+
+    It used to stub `subprocess.run` directly. That call is still made — one
+    thread deeper — but patching it here would bypass the thread offload and
+    the timeout's process-tree kill, leaving both untested. Those two have
+    their own file: `test_cli_runner.py`.
+    """
     state = {"calls": []}
     if callable(returns):
-        def _run(*args, **kwargs):
+        async def _run(*args, **kwargs):
             state["calls"].append((args, kwargs))
             return returns(args, kwargs)
     elif isinstance(returns, list):
         it = iter(returns)
-        def _run(*args, **kwargs):
+        async def _run(*args, **kwargs):
             state["calls"].append((args, kwargs))
             return next(it)
     else:
-        def _run(*args, **kwargs):
+        async def _run(*args, **kwargs):
             state["calls"].append((args, kwargs))
             return returns
-    monkeypatch.setattr(
-        "flowboard.services.claude_cli.subprocess.run", _run,
-    )
+    monkeypatch.setattr("flowboard.services.claude_cli.run_cli", _run)
     return state
 
 
@@ -71,7 +76,7 @@ def _stub_resolve(monkeypatch, path: str = "/fake/bin/claude"):
 
 @pytest.mark.asyncio
 async def test_run_claude_pipes_prompt_via_stdin(monkeypatch):
-    """Critical Windows fix: prompt is sent via stdin (kwargs['input'])
+    """Critical Windows fix: prompt is sent via stdin (kwargs['stdin_data'])
     rather than ``-p <prompt>`` argv. This avoids cmd.exe re-parsing
     breaking long prompts on ``.cmd``-shimmed npm installs."""
     _stub_resolve(monkeypatch)
@@ -83,7 +88,7 @@ async def test_run_claude_pipes_prompt_via_stdin(monkeypatch):
     args, kwargs = state["calls"][0]
     argv = list(args[0])
     # Prompt must be on stdin, NOT in argv after `-p`.
-    assert kwargs["input"] == b"say hi"
+    assert kwargs["stdin_data"] == b"say hi"
     p_idx = argv.index("-p")
     assert argv[p_idx + 1] == "--output-format", (
         "argv should be `-p --output-format json …`, not `-p <prompt> …`"
@@ -112,7 +117,7 @@ async def test_run_claude_attachments_embed_as_at_paths(monkeypatch, tmp_path):
     args, kwargs = state["calls"][0]
     argv = list(args[0])
     # @<path> tokens are part of the stdin-delivered prompt body.
-    stdin_text = kwargs["input"].decode("utf-8")
+    stdin_text = kwargs["stdin_data"].decode("utf-8")
     assert f"@{img_a}" in stdin_text
     assert f"@{img_b}" in stdin_text
     assert "describe this" in stdin_text
@@ -185,9 +190,9 @@ async def test_run_claude_raises_on_non_json_stdout(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_claude_file_not_found_raises_clean_error(monkeypatch):
     _stub_resolve(monkeypatch)
-    def _raise(*a, **kw):
+    async def _raise(*a, **kw):
         raise FileNotFoundError("claude")
-    monkeypatch.setattr("flowboard.services.claude_cli.subprocess.run", _raise)
+    monkeypatch.setattr("flowboard.services.claude_cli.run_cli", _raise)
     with pytest.raises(claude_cli.ClaudeCliError, match="not found on PATH"):
         await claude_cli.run_claude(user_prompt="x")
 
@@ -195,9 +200,9 @@ async def test_run_claude_file_not_found_raises_clean_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_claude_timeout_raises_clean_error(monkeypatch):
     _stub_resolve(monkeypatch)
-    def _raise(*a, **kw):
+    async def _raise(*a, **kw):
         raise _subprocess.TimeoutExpired(cmd="claude", timeout=0.05)
-    monkeypatch.setattr("flowboard.services.claude_cli.subprocess.run", _raise)
+    monkeypatch.setattr("flowboard.services.claude_cli.run_cli", _raise)
     with pytest.raises(claude_cli.ClaudeCliError, match="timed out"):
         await claude_cli.run_claude(user_prompt="x", timeout=0.05)
 
@@ -206,12 +211,25 @@ async def test_run_claude_timeout_raises_clean_error(monkeypatch):
 async def test_is_available_cached_after_first_probe(monkeypatch):
     claude_cli.reset_availability_cache()
     _stub_resolve(monkeypatch)
-    state = _stub_run(monkeypatch, _FakeResult(returncode=0, stdout=b"2.1.119"))
+    # The availability probe goes through `run_cli` like everything else.
+    # This comment used to say the opposite — "it is fast, and the thread
+    # offload would add a hop to something that finishes in milliseconds"
+    # — and that reasoning was wrong twice over: "fast" describes a healthy
+    # machine rather than a guarantee, and the call sat inside a coroutine,
+    # so a slow one pinned the event loop for up to its 5s bound. The hop
+    # costs microseconds; the alternative cost whole seconds of agent.
+    calls = []
+
+    async def _probe(args, **kw):
+        calls.append((args, kw))
+        return _FakeResult(returncode=0, stdout=b"2.1.119")
+
+    monkeypatch.setattr("flowboard.services.claude_cli.run_cli", _probe)
     r1 = await claude_cli.is_available()
     r2 = await claude_cli.is_available()
     assert r1 is True and r2 is True
     # Second call should hit the cache, not exec again.
-    assert len(state["calls"]) == 1
+    assert len(calls) == 1
     claude_cli.reset_availability_cache()
 
 
