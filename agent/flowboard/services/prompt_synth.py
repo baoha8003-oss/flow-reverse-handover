@@ -19,6 +19,7 @@ from sqlmodel import select
 
 from flowboard.db import get_session
 from flowboard.db.models import Edge, Node
+from flowboard.services import styles
 from flowboard.services.activity import record_activity
 from flowboard.services.llm import run_llm
 from flowboard.services.llm.base import LLMError
@@ -492,7 +493,11 @@ _BATCH_SUFFIX = (
 
 
 async def auto_prompt_batch(
-    node_id: int, count: int, *, camera: Optional[str] = None
+    node_id: int,
+    count: int,
+    *,
+    camera: Optional[str] = None,
+    style: Optional[str] = None,
 ) -> list[str]:
     """Compose N pose-distinct prompts in a single Claude call.
 
@@ -500,11 +505,15 @@ async def auto_prompt_batch(
     prompt × N seeds produces near-identical poses. Each item in the
     returned list picks a different stance from the pool so the variants
     actually look like different shots.
+
+    ``style`` names a visual-style preset and is applied exactly as in
+    ``auto_prompt``: without it, asking for several variants silently
+    dropped the art direction that one variant would have honoured.
     """
     if count < 1:
         raise PromptSynthError("count must be >= 1")
     if count == 1:
-        single = await auto_prompt(node_id, camera=camera)
+        single = await auto_prompt(node_id, camera=camera, style=style)
         return [single]
 
     records, target = _collect_upstream(node_id)
@@ -518,11 +527,17 @@ async def auto_prompt_batch(
     else:
         base_system = _image_system_prompt(subject_count)
     system_prompt = base_system + _BATCH_SUFFIX.format(count=count)
+    system_prompt += styles.style_directive(style)
     user_msg = _format_user_message(records, target)
 
     async with record_activity(
         "auto_prompt_batch",
-        params={"node_id": node_id, "count": count, "camera": camera},
+        params={
+            "node_id": node_id,
+            "count": count,
+            "camera": camera,
+            "style": style,
+        },
         node_id=node_id,
     ) as activity:
         try:
@@ -539,36 +554,269 @@ async def auto_prompt_batch(
         except LLMError as exc:
             raise PromptSynthError(f"auto-prompt provider failed: {exc}") from exc
 
-        text = (text or "").strip()
-        # Strip markdown fences if the provider added them despite instructions.
-        if text.startswith("```"):
-            text = text.lstrip("`")
-            # "json\n[...]\n```" → "[...]\n"
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.rsplit("```", 1)[0].strip()
-
-        try:
-            arr = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise PromptSynthError(
-                f"auto-prompt provider returned non-JSON for batch: {text[:200]!r}"
-            ) from exc
-        if not isinstance(arr, list):
-            raise PromptSynthError("auto-prompt batch response is not a JSON array")
-        prompts = [str(p).strip() for p in arr if isinstance(p, str) and p.strip()]
-        if not prompts:
-            raise PromptSynthError("auto-prompt batch returned no valid prompts")
-        # Pad / trim to requested count. If the provider returned fewer, repeat
-        # the last one — better to have N items than fail the dispatch.
-        while len(prompts) < count:
-            prompts.append(prompts[-1])
-        prompts = prompts[:count]
+        prompts = parse_prompt_array(text, count)
         activity.set_result({"prompts": prompts})
         return prompts
 
 
-async def auto_prompt(node_id: int, *, camera: Optional[str] = None) -> str:
+def parse_prompt_array(text: Optional[str], count: int) -> list[str]:
+    """A model's JSON-array reply → exactly ``count`` prompt strings.
+
+    Shared by every batch path. Models add markdown fences despite being
+    told not to, so those are stripped before parsing; a short reply is
+    padded rather than failed, because N-1 usable prompts is a better
+    outcome than none.
+    """
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.lstrip("`")
+        # "json\n[...]\n```" → "[...]\n"
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.rsplit("```", 1)[0].strip()
+
+    try:
+        arr = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PromptSynthError(
+            f"auto-prompt provider returned non-JSON for batch: {text[:200]!r}"
+        ) from exc
+    if not isinstance(arr, list):
+        raise PromptSynthError("auto-prompt batch response is not a JSON array")
+    prompts = [str(p).strip() for p in arr if isinstance(p, str) and p.strip()]
+    if not prompts:
+        raise PromptSynthError("auto-prompt batch returned no valid prompts")
+    while len(prompts) < count:
+        prompts.append(prompts[-1])
+    return prompts[:count]
+
+
+_IDEA_SYSTEM = (
+    "You are a director turning a rough idea into a shot list for an "
+    "AI video generator. Write {count} consecutive scene prompts that tell "
+    "ONE continuous story in order — scene N+1 must follow on from scene N, "
+    "not restate it.\n"
+    "Each prompt: English, one paragraph, under 900 characters, describing "
+    "subject, action, setting, lighting and camera. Every scene is {seconds} "
+    "seconds long, so describe an action that fits in {seconds} seconds.\n"
+    "Keep the same characters visually consistent across scenes: repeat the "
+    "same concrete description of hair, age, build and clothing in every prompt that "
+    "features them, because the generator has no memory between scenes.\n"
+    "{dialogue}\n"
+    "Output ONLY a JSON array of exactly {count} strings — no preamble, no "
+    "markdown fences."
+)
+
+
+def script_knowledge(
+    genre: Optional[str],
+    *,
+    use_longform: bool = False,
+    use_3act: bool = False,
+    video_format: Optional[str] = None,
+) -> str:
+    """The packaged tool's script knowledge for this call.
+
+    A named genre brings its own structure and per-scene dialogue length;
+    without one, the general craft notes (hook construction, the retention
+    spine, McKee-derived structure) apply. Either way the material is read
+    from `ASSET_ROOT` at call time, so an uninstalled asset library costs
+    knowledge rather than raising — this step ran without any of it before.
+
+    ``use_longform`` / ``use_3act`` are the README's own two supplements —
+    sequence orchestration for a 10–30 minute piece, and the three-act eight-
+    sequence structure. They existed as `script_genres.SUPPLEMENTS` with no
+    caller: `use_hook=True` was hardcoded here and the other two were
+    unreachable from anywhere a user could press.
+
+    ``video_format`` names a playbook for ONE shape of video (micro-drama,
+    trailer, found footage, multi-shot, a shot-planning worksheet). Kept out of
+    the always-loaded set on purpose: a found-footage horror example is the
+    wrong thing to put in front of a Buddhist parable.
+    """
+    from flowboard.services import knowledge
+
+    parts: list[str] = []
+    if genre:
+        from flowboard.services import script_genres
+
+        try:
+            parts.append(
+                script_genres.full_prompt(
+                    genre,
+                    use_hook=True,
+                    use_longform=use_longform,
+                    use_3act=use_3act,
+                )
+            )
+        except KeyError:
+            logger.warning("prompt_synth: unknown genre %r, using craft notes", genre)
+
+    if not parts:
+        craft = knowledge.sections_for("storyboard")
+        if craft.text:
+            parts.append(
+                "--- Craft notes (from the packaged tool's skill library) ---\n"
+                + craft.text
+            )
+        # No genre means no supplement was applied above, so apply them here:
+        # the flags are the user's, not the genre's.
+        for flag, enabled in (("use_longform", use_longform), ("use_3act", use_3act)):
+            if not enabled:
+                continue
+            from flowboard.services import script_genres
+
+            extra = knowledge.load_paths(
+                [script_genres.SUPPLEMENTS[flag]], budget_bytes=12_000
+            )
+            if extra.text:
+                parts.append(extra.text)
+
+    if video_format:
+        playbook = knowledge.format_playbook(video_format)
+        if playbook.text:
+            parts.append(
+                "--- Format playbook ---\n" + playbook.text
+            )
+
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+async def idea_to_prompts(
+    idea: str,
+    *,
+    scene_count: int,
+    seconds_per_scene: int = 8,
+    style: Optional[str] = None,
+    dialogue_language: Optional[str] = None,
+    no_dialogue: bool = False,
+    genre: Optional[str] = None,
+    use_longform: bool = False,
+    use_3act: bool = False,
+    video_format: Optional[str] = None,
+) -> list[str]:
+    """Turn a free-text idea into an ordered list of scene prompts.
+
+    Unlike ``auto_prompt``, this has no canvas node to walk — the idea IS
+    the whole input, which is what the packaged tool's "Ý tưởng to Video"
+    tab does. The result feeds straight into the normal video dispatch.
+
+    ``genre`` picks one of the packaged tool's eight Vietnamese script
+    formulas. Each brings its own structure and — the part that decides
+    whether a clip has to be re-cut — a per-scene dialogue length, because a
+    scene is 5–8 seconds and roughly 30 words is what a voice fits inside
+    one.
+    """
+    idea = (idea or "").strip()
+    if not idea:
+        raise PromptSynthError("idea is required")
+    if scene_count < 1:
+        raise PromptSynthError("scene_count must be >= 1")
+
+    if no_dialogue or not dialogue_language:
+        dialogue = "No spoken dialogue: describe action and atmosphere only."
+    else:
+        dialogue = (
+            f"Include a short spoken line for the character in "
+            f"{dialogue_language}, written inside the prompt as dialogue."
+        )
+    system = _IDEA_SYSTEM.format(
+        count=scene_count, seconds=seconds_per_scene, dialogue=dialogue
+    ) + styles.style_directive(style) + script_knowledge(
+        genre,
+        use_longform=use_longform,
+        use_3act=use_3act,
+        video_format=video_format,
+    )
+
+    async with record_activity(
+        "idea_to_prompts",
+        params={
+            "scene_count": scene_count,
+            "style": style,
+            "dialogue_language": dialogue_language,
+            "no_dialogue": no_dialogue,
+            "genre": genre,
+            "use_longform": use_longform,
+            "use_3act": use_3act,
+            "format": video_format,
+        },
+    ) as activity:
+        try:
+            text = await run_llm(
+                "auto_prompt", f"Idea:\n{idea}", system_prompt=system, timeout=120.0
+            )
+        except LLMError as exc:
+            raise PromptSynthError(f"auto-prompt provider failed: {exc}") from exc
+        prompts = parse_prompt_array(text, scene_count)
+        activity.set_result({"prompts": prompts})
+        return prompts
+
+
+async def auto_prompt_ensemble(
+    node_id: int,
+    *,
+    camera: Optional[str] = None,
+    style: Optional[str] = None,
+) -> dict:
+    """`auto_prompt`, but every available model drafts and one judges.
+
+    Same brief and same system prompt as the single-provider path — only the
+    number of models changes — so the two are comparable and the ensemble is
+    not quietly solving a different problem.
+
+    Returns the winning prompt alongside every draft and the judge's reason.
+    The drafts are half the point: a prompt whose alternatives you cannot
+    see is one you cannot argue with.
+    """
+    from flowboard.services import prompt_ensemble
+    from flowboard.services.llm.base import LLMError
+
+    records, target = _collect_upstream(node_id)
+    if target is None:
+        raise PromptSynthError(f"node {node_id} not found")
+
+    subject_count = len(_distinct_subjects(records))
+    system_prompt = (
+        _video_system_prompt(camera, subject_count)
+        if target.type == "video"
+        else _image_system_prompt(subject_count)
+    )
+    system_prompt += styles.style_directive(style)
+
+    async with record_activity(
+        "auto_prompt_ensemble",
+        params={"node_id": node_id, "camera": camera},
+        node_id=node_id,
+    ) as activity:
+        try:
+            result = await prompt_ensemble.compose(
+                _format_user_message(records, target),
+                system_prompt=system_prompt,
+                timeout=120.0,
+                max_chars=500,
+            )
+        except LLMError as exc:
+            raise PromptSynthError(str(exc)) from exc
+
+        activity.set_result(
+            {"prompt": result.prompt, "providers": len(result.drafts)}
+        )
+        return {
+            "prompt": result.prompt,
+            "judge": result.judge,
+            "why": result.why,
+            "chosen": result.chosen,
+            "drafts": [
+                {"provider": d.provider, "prompt": d.text, "error": d.error}
+                for d in result.drafts
+            ],
+        }
+
+
+async def auto_prompt(
+    node_id: int, *, camera: Optional[str] = None, style: Optional[str] = None
+) -> str:
     """Compose a generation prompt by walking upstream + asking the
     configured Auto-Prompt provider.
 
@@ -579,6 +827,11 @@ async def auto_prompt(node_id: int, *, camera: Optional[str] = None) -> str:
       (i2v has exactly one upstream image — multi-ref isn't a thing). The
       ``camera`` arg (e.g. ``"static"``) selects a system-prompt variant so
       the synthesiser respects the user's framing constraint.
+
+    ``style`` names a preset from the visual-style library (see
+    ``flowboard.services.styles``). Its art direction is appended last so it
+    wins over the default editorial look baked into the system prompts. An
+    unknown name is ignored rather than failing the generation.
     """
     records, target = _collect_upstream(node_id)
     if target is None:
@@ -590,6 +843,7 @@ async def auto_prompt(node_id: int, *, camera: Optional[str] = None) -> str:
         system_prompt = _video_system_prompt(camera, subject_count)
     else:
         system_prompt = _image_system_prompt(subject_count)
+    system_prompt += styles.style_directive(style)
     user_msg = _format_user_message(records, target)
 
     async with record_activity(

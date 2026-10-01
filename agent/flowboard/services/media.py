@@ -10,7 +10,10 @@ GCS signed URLs are self-contained (signature + expiry in the query string)
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,6 +79,41 @@ def cached_path(media_id: str) -> Optional[Path]:
     return _cache_glob(media_id)
 
 
+def ingest_local_file(path: str | Path, *, kind: str) -> str:
+    """Adopt a file local post-production just produced into the media cache.
+
+    ffmpeg/RealESRGAN/TTS write into their own output folders, which the
+    media pipeline knows nothing about — the canvas only chains work by
+    media id, the same way it does for Flow-generated clips. This mints a
+    fresh id, copies the bytes under it (never moves: the source may still
+    be a render the user wants to keep browsing in its own folder), and
+    upserts an Asset row with no ``url`` — this file never touched Flow, so
+    there is no signed link to ever refresh.
+    """
+    src = Path(path)
+    if not src.is_file():
+        raise FileNotFoundError(f"cannot ingest missing file: {src}")
+    media_id = str(uuid.uuid4())
+    # uuid4 always matches _MEDIA_ID_RE and can never collide with an
+    # existing row in practice, but the whole point of a media id is that
+    # cached_path can find it afterwards — that invariant is worth a
+    # cheap runtime check rather than an assumption.
+    if not is_valid_media_id(media_id):  # pragma: no cover
+        raise RuntimeError(f"generated media id failed validation: {media_id}")
+    dest = MEDIA_CACHE_DIR / f"{media_id}{src.suffix}"
+    shutil.copyfile(src, dest)
+    with get_session() as s:
+        row = s.exec(select(Asset).where(Asset.uuid_media_id == media_id)).first()
+        if row is None:
+            row = Asset(uuid_media_id=media_id, kind=kind, local_path=str(dest))
+        else:  # pragma: no cover — a fresh uuid4 colliding is not realistic
+            row.kind = kind
+            row.local_path = str(dest)
+        s.add(row)
+        s.commit()
+    return media_id
+
+
 def ingest_urls(urls: list[dict[str, Any]]) -> int:
     """Upsert Asset rows keyed by uuid_media_id. Returns count touched."""
     touched = 0
@@ -110,41 +148,6 @@ def ingest_urls(urls: list[dict[str, Any]]) -> int:
     return touched
 
 
-def ingest_inline_bytes(
-    media_id: str, data: bytes, *, kind: str = "video", mime: str = "video/mp4"
-) -> bool:
-    """Cache pre-fetched media bytes and mark the Asset as locally available.
-
-    Used by workflow-mode video poll (Low Priority models) where Flow returns
-    base64-encoded MP4 inline on ``/v1/media/<id>`` instead of a signed GCS
-    URL. The bytes never traverse ``fetch_and_cache`` so we plant them here
-    and the existing ``/media/<id>`` route serves them like any other asset.
-    """
-    if not is_valid_media_id(media_id) or not data:
-        return False
-    ext = _EXT_BY_MIME.get(mime, ".mp4")
-    path = MEDIA_CACHE_DIR / f"{media_id}{ext}"
-    try:
-        path.write_bytes(data)
-    except OSError as exc:
-        logger.error("failed to write inline cache %s: %s", path, exc)
-        return False
-    with get_session() as s:
-        row = s.exec(
-            select(Asset).where(Asset.uuid_media_id == media_id)
-        ).first()
-        if row is None:
-            row = Asset(uuid_media_id=media_id, url=None, kind=kind)
-        row.local_path = str(path)
-        row.mime = mime
-        if not row.kind:
-            row.kind = kind
-        s.add(row)
-        s.commit()
-    logger.info("media: ingested %d inline bytes for %s", len(data), media_id)
-    return True
-
-
 async def fetch_and_cache(media_id: str) -> Optional[tuple[bytes, str, Path]]:
     """If the Asset has a URL and no cached file, fetch bytes, cache, return.
 
@@ -169,7 +172,7 @@ async def fetch_and_cache(media_id: str) -> Optional[tuple[bytes, str, Path]]:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(url)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("GCS fetch failed for %s: %s", media_id, exc)
         return None
 
@@ -201,7 +204,56 @@ async def fetch_and_cache(media_id: str) -> Optional[tuple[bytes, str, Path]]:
             s.add(row)
             s.commit()
 
+    _export_to_output_dir(media_id, resp.content, mime)
     return resp.content, mime, path
+
+
+def _export_to_output_dir(media_id: str, data: bytes, mime: str) -> None:
+    """Also drop the file into the user's own output folder.
+
+    The packaged tool writes finished media to
+    ``<VIDEO_OUTPUT_DIR>/<project>/{video,image}``, and people expect to find
+    their clips there rather than only inside the app. The cache copy is what
+    the UI plays; this one is for the filesystem.
+
+    Never raises: a full disk or a bad path must not turn a finished,
+    already-paid generation into a failure. It logs and moves on.
+    """
+    try:
+        base = output_dir()
+        if base is None:
+            return
+        out_dir = base / ("video" if mime.startswith("video/") else "image")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"{media_id}{_EXT_BY_MIME.get(mime, '.bin')}"
+        if target.exists():
+            return
+        # Write under a temp name first: a crash mid-write must not leave a
+        # half file that looks like a finished render.
+        tmp = target.with_suffix(target.suffix + ".part")
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+        logger.info("media %s exported to %s", media_id[:8], target)
+    except Exception as exc:
+        logger.warning("could not export %s to the output folder: %s", media_id[:8], exc)
+
+
+def output_dir() -> Optional[Path]:
+    """Where finished media is written outside the app, or None.
+
+    The same resolution `_export_to_output_dir` uses, factored out so the
+    "open results folder" action opens exactly the folder the exporter
+    writes to. Deriving it a second time is how the button ends up opening
+    somewhere plausible and empty.
+    """
+    from flowboard.services import settings_store
+
+    settings = settings_store.get_all()
+    root = str(settings.get("VIDEO_OUTPUT_DIR") or "").strip()
+    if not root:
+        return None
+    project = Path(str(settings.get("CURRENT_PROJECT") or "")).name or "default_project"
+    return Path(root) / project
 
 
 def status(media_id: str) -> dict:

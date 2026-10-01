@@ -23,16 +23,21 @@ auto-prompt synth that expects a JSON array reply from the model).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import subprocess
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
+
+from flowboard.services import gemini_keys
 
 from .base import LLMError
 from .cli_utils import (
     resolve_cli_binary,
-    get_windows_npm_paths,
     validate_prompt_size,
     validate_attachment_paths,
     DEFAULT_SUBPROCESS_TIMEOUT,
@@ -63,6 +68,35 @@ _PROBE_TIMEOUT = CLI_PROBE_TIMEOUT
 # (slower but better for Planner JSON quality) or any other variant.
 _DEFAULT_MODEL: str | None = "gemini-2.5-flash"
 
+# ── API mode ──────────────────────────────────────────────────────────────
+# The CLI needs an interactive OAuth login, which is a wall for anyone who
+# cannot complete it — and for anyone this app is handed to. An API key works
+# immediately and is what the packaged tool asks for, so the provider accepts
+# either. Same REST surface `tts.py` already calls, different model.
+_API_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+# The API needs an explicit model; unlike the CLI there is no saved default.
+#
+# A floating alias, not a pinned version: a pinned `gemini-2.5-flash` now
+# answers 404 "no longer available to new users", so hardcoding a version
+# schedules an outage.
+#
+# Lite rather than full flash, measured on the same one-line prompt:
+#   gemini-flash-lite-latest   1.3s   200
+#   gemini-3.6-flash          12.4s   200
+#   gemini-flash-latest      113.0s   503 (overloaded)
+# Output quality on prompt composition was comparable, and this model is
+# called once per node in the canvas — a 12s floor there reads as broken.
+# Pin something heavier with FLOWBOARD_GEMINI_MODEL if planner JSON needs it.
+#
+# Note: `generationConfig.thinkingConfig.thinkingBudget = 0` is NOT accepted
+# by these models (answers 400), so latency cannot be bought back that way.
+_API_MODEL = "gemini-flash-lite-latest"
+_API_TIMEOUT_S = 120.0
+# One retry per extra key: a 429 on one key says nothing about the next.
+_API_MAX_KEY_ATTEMPTS = 4
+
 
 class GeminiProvider:
     """Conforms to ``LLMProvider`` (structural typing).
@@ -88,6 +122,10 @@ class GeminiProvider:
 
     name: str = "gemini"
     supports_vision: bool = True  # Gemini Flash + Pro both have vision
+    # The only provider here that takes audio: the REST path sends it as
+    # `inline_data`. Subtitles and karaoke timing therefore rest on this
+    # one provider, which is why the health view reports it separately.
+    supports_audio: bool = True
     test_timeout_secs: float = 180.0  # Retries with backoff on 429 quota exhaustion
 
     def __init__(self) -> None:
@@ -100,16 +138,28 @@ class GeminiProvider:
     # ── availability ──────────────────────────────────────────────────
 
     async def is_available(self) -> bool:
-        """Cached check: does ``gemini --version`` exit 0?
+        """True when EITHER the CLI or an API key can serve a dispatch.
 
-        Doesn't verify auth — the user could have the CLI installed but
-        not signed in. The Test endpoint catches that by actually
-        invoking the model. Mirrors the claude_cli pattern.
+        The CLI check doesn't verify auth — the user could have the binary
+        installed but not signed in. The Test endpoint catches that by
+        actually invoking the model.
         """
         if self._available is None:
             self._available = await self._probe_version()
-            logger.info("gemini: available=%s", self._available)
-        return self._available
+            logger.info("gemini: cli available=%s", self._available)
+        return self._available or gemini_keys.available()
+
+    @property
+    def mode(self) -> str:
+        """Which transport ``run()`` would pick right now: 'cli' / 'api' /
+        'none'. Reported by ``/api/llm/providers`` so the Settings card can
+        say how this provider is authenticated. Mirrors ``run()``'s order —
+        key first, then CLI."""
+        if gemini_keys.available():
+            return "api"
+        if self._available:
+            return "cli"
+        return "none"
 
     def reset_cache(self) -> None:
         """Testing hook + Settings panel rescan support."""
@@ -121,7 +171,11 @@ class GeminiProvider:
         # Use shared binary resolver which tries PATH + npm locations
         try:
             gemini_bin = resolve_cli_binary(_CLI_BIN, _PROBE_TIMEOUT)
-            result = subprocess.run(
+            # In a thread, not inline: this runs during startup and during
+            # every health check, and inline it stalls the event loop for as
+            # long as the CLI takes to answer.
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [gemini_bin, "--version"],
                 capture_output=True,
                 timeout=_PROBE_TIMEOUT,
@@ -134,7 +188,7 @@ class GeminiProvider:
         except subprocess.TimeoutExpired:
             logger.warning("gemini: probe timed out")
             return False
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning("gemini: probe failed: %s", e)
             return False
 
@@ -170,6 +224,25 @@ class GeminiProvider:
         except ValueError as exc:
             raise LLMError(f"Invalid input: {exc}") from exc
 
+        # An API key wins over the CLI when both look present.
+        #
+        # Measured on this machine: `gemini --version` exits 0 while every
+        # real call dies with
+        #   IneligibleTierError: This client is no longer supported for Gemini
+        #   Code Assist for individuals … migrate to Antigravity
+        # Google retired that login for individual accounts, so a passing
+        # version probe says nothing about whether a dispatch will work. A key
+        # is the transport that actually answers, so prefer it and keep the
+        # CLI for hosts that have a working (enterprise) setup and no key.
+        if gemini_keys.available():
+            return await self._run_api(
+                user_prompt, system_prompt, attachments, timeout
+            )
+        # No key: fall through to the CLI exactly as before — including
+        # letting `resolve_cli_binary` raise when the binary is missing, which
+        # is the error the caller already knows how to report. Probing here
+        # instead would spend an extra `subprocess.run` on every dispatch.
+
         # Build the composite prompt: system block, user prompt, attachments.
         parts: list[str] = []
         if system_prompt:
@@ -201,17 +274,90 @@ class GeminiProvider:
         async with self._call_lock:
             return await self._invoke_locked(args, timeout=timeout)
 
+    # ── API dispatch ─────────────────────────────────────────────────────
+
+    async def _run_api(
+        self,
+        user_prompt: str,
+        system_prompt: Optional[str],
+        attachments: Optional[list[str]],
+        timeout: float,
+    ) -> str:
+        """One ``generateContent`` call, rotating keys past quota errors.
+
+        A 429 on one key says nothing about the next, so an exhausted key is
+        rested and the call retried on another rather than failed outright —
+        that is the entire reason the packaged tool ships a list of keys.
+        """
+        parts: list[dict[str, Any]] = [{"text": user_prompt}]
+        for path in attachments or []:
+            parts.append(_inline_media(path))
+        payload: dict[str, Any] = {"contents": [{"parts": parts}]}
+        if system_prompt:
+            payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+
+        model = os.environ.get("FLOWBOARD_GEMINI_MODEL") or _API_MODEL
+        url = _API_ENDPOINT.format(model=model)
+
+        # At least two tries even with a single key: a dropped connection is
+        # transient, and failing a whole dispatch on one blip is needless.
+        # (Observed: one call died with an httpx error carrying no message at
+        # all, and the identical request succeeded immediately after.)
+        attempts = max(2, min(_API_MAX_KEY_ATTEMPTS, gemini_keys.count() or 1))
+        last_error = "Gemini API call failed"
+        for _attempt in range(attempts):
+            key = gemini_keys.next_key()
+            if not key:
+                raise LLMError("No usable Gemini API key is configured.")
+            try:
+                async with httpx.AsyncClient(
+                    timeout=min(timeout, _API_TIMEOUT_S)
+                ) as client:
+                    resp = await client.post(
+                        url, json=payload, headers={"x-goog-api-key": key}
+                    )
+            except httpx.HTTPError as exc:
+                # Several httpx errors stringify to nothing, which turned this
+                # into a bare "request failed:" that said less than silence.
+                # The class name is the only reliable signal, so carry it.
+                # httpx also puts the request — and any header it was handed —
+                # into its own message, hence the redact.
+                last_error = gemini_keys.redact(
+                    f"{type(exc).__name__}: {exc}".rstrip(": "), key
+                )
+                continue
+
+            if resp.status_code == 200:
+                return _text_from_response(resp.json())
+            if resp.status_code == 429:
+                # This key is out of quota — rest it and try another.
+                gemini_keys.mark_exhausted(key)
+                last_error = _api_error_message(resp)
+                continue
+            if resp.status_code == 503:
+                # The MODEL is overloaded, which says nothing about the key.
+                # Resting a perfectly good key here would shrink the pool for
+                # a problem on Google's side.
+                last_error = _api_error_message(resp)
+                continue
+            raise LLMError(gemini_keys.redact(_api_error_message(resp), key))
+
+        raise LLMError(f"Gemini API failed after {attempts} tries. {last_error}")
+
     async def _invoke_locked(
         self, args: list[str], *, timeout: float
     ) -> str:
         """Subprocess invocation using subprocess.run (Windows-compatible).
 
-        Assumed to be holding ``_call_lock``. This remains async for
-        compatibility with the semaphore pattern, but internally uses
-        synchronous subprocess.run() which avoids asyncio subprocess
-        issues on Windows."""
+        Assumed to be holding ``_call_lock``. `subprocess.run` rather than
+        asyncio's own subprocess support, which has real problems on Windows —
+        but handed to a thread rather than run inline. Inline it blocked the
+        event loop for the whole call: the extension bridge, the worker queue
+        and every HTTP handler share that loop, and a slow Gemini answer froze
+        all of them for up to `timeout`, which on the chain path is minutes."""
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 args,
                 capture_output=True,
                 timeout=timeout,
@@ -221,7 +367,7 @@ class GeminiProvider:
             raise LLMError("gemini CLI not found on PATH") from exc
         except subprocess.TimeoutExpired as exc:
             raise LLMError(f"gemini CLI timed out after {timeout}s (likely quota exhaustion or network issue)") from exc
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise LLMError(f"gemini CLI error: {exc}") from exc
 
         if result.returncode != 0:
@@ -249,3 +395,74 @@ class GeminiProvider:
         if not isinstance(response, str):
             raise LLMError("gemini CLI envelope missing string 'response' field")
         return response.strip()
+
+
+# ── API helpers ───────────────────────────────────────────────────────────
+
+
+def _inline_media(path: str) -> dict[str, Any]:
+    """Read an attachment into an ``inline_data`` block.
+
+    The CLI takes ``@/path`` tokens and reads the file itself; the REST API
+    has no filesystem, so the bytes travel base64-encoded in the request.
+
+    Audio is allowed as well as images: Gemini transcribes it, which is what
+    the automatic-subtitle path needs. Everything else is refused here rather
+    than sent and rejected by the API with a less obvious message.
+    """
+    mime, _ = mimetypes.guess_type(path)
+    mime = mime or ""
+    if not (mime.startswith("image/") or mime.startswith("audio/")):
+        raise LLMError(
+            f"Attachment is not an image or audio file: {os.path.basename(path)}"
+        )
+    try:
+        raw = open(path, "rb").read()
+    except OSError as exc:
+        raise LLMError(f"Could not read attachment {os.path.basename(path)}") from exc
+    return {
+        "inline_data": {
+            "mime_type": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    }
+
+
+def _text_from_response(body: Any) -> str:
+    """Join the text parts of the first candidate.
+
+    A response can legitimately carry several parts, and taking only the
+    first silently truncates a long answer — which then fails downstream as
+    a JSON parse error rather than as the truncation it is.
+    """
+    if not isinstance(body, dict):
+        raise LLMError("Gemini API returned an unexpected payload")
+    candidates = body.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        # A prompt blocked by safety filters comes back with no candidates
+        # and a promptFeedback block explaining why.
+        feedback = body.get("promptFeedback")
+        if isinstance(feedback, dict) and feedback.get("blockReason"):
+            raise LLMError(
+                f"Gemini refused the prompt: {feedback.get('blockReason')}"
+            )
+        raise LLMError("Gemini API returned no candidates")
+    content = candidates[0].get("content") if isinstance(candidates[0], dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        raise LLMError("Gemini API candidate carried no content")
+    text = "".join(
+        p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str)
+    ).strip()
+    if not text:
+        raise LLMError("Gemini API returned an empty response")
+    return text
+
+
+def _api_error_message(resp: httpx.Response) -> str:
+    """The API's own explanation, without echoing the whole body."""
+    try:
+        detail = resp.json().get("error", {}).get("message")
+    except Exception:
+        detail = None
+    return f"Gemini API {resp.status_code}: {detail or resp.reason_phrase}"

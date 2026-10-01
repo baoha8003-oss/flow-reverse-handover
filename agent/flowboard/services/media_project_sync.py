@@ -31,7 +31,7 @@ from typing import Optional
 from sqlmodel import select
 
 from flowboard.db import get_session
-from flowboard.db.models import Asset, MediaProjectMapping
+from flowboard.db.models import MediaProjectMapping
 from flowboard.services import media as media_service
 from flowboard.services.flow_sdk import get_flow_sdk
 
@@ -113,7 +113,7 @@ async def ensure_media_in_project(
                 )
             )
             s.commit()
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception(
             "MediaProjectMapping insert race for (%s, %s) — re-reading",
             original_media_id, project_id,

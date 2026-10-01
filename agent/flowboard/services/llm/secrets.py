@@ -4,7 +4,7 @@ Schema of ``~/.flowboard/secrets.json``:
 
 ```json
 {
-  "apiKeys": {"openai": "sk-..."},
+  "apiKeys": {"openai": "sk-...", "gemini": "..."},
   "activeProviders": {
     "auto_prompt": "claude",
     "vision": "gemini",

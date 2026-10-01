@@ -106,7 +106,7 @@ async def record_activity(
                     row.finished_at = datetime.now(timezone.utc)
                     s.add(row)
                     s.commit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "activity: failed to mark row %d as failed (original exc preserved)", rid
             )
@@ -121,7 +121,7 @@ async def record_activity(
                     row.finished_at = datetime.now(timezone.utc)
                     s.add(row)
                     s.commit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             # Wrapped op succeeded; only the bookkeeping write failed.
             # Don't propagate — the user got their result. Log loudly so
             # operators see the row is stuck on "running" and can act.

@@ -2,16 +2,19 @@
 
 Consolidates cross-provider patterns:
 - Binary path resolution (PATH + Windows npm fallback)
+- Running a CLI without freezing the event loop or outliving its timeout
 - Subprocess error handling
 - Input validation (prompt size, attachment limits)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
-from typing import Optional, Type
+import sys
+from typing import Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +99,110 @@ def resolve_cli_binary(
         f"{cli_name}: not found in PATH or npm locations, falling back to '{cli_name}'"
     )
     return cli_name
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a CLI process AND its children.
+
+    Every one of these CLIs is installed by npm, so on Windows the thing we
+    launch is a ``.cmd`` shim that spawns ``node``. Killing only the shim
+    leaves node running: after one wedged dispatch this machine had nine
+    orphaned ``node.exe`` processes still resident.
+
+    To be precise about what this does and does not fix — a mutation test
+    settled it — killing the tree is NOT what unblocks the caller. The
+    bounded drain in ``run_cli_sync`` is; see the comment there. This stops
+    the orphan from outliving the request, which is a separate problem and
+    a real one.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        logger.warning("cli: could not kill process tree for pid %s", proc.pid)
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def run_cli_sync(
+    args: Sequence[str],
+    *,
+    stdin_data: bytes = b"",
+    timeout: float,
+    env: Optional[Mapping[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    """Run a CLI to completion, killing the whole tree if it overruns.
+
+    Same contract as ``subprocess.run(capture_output=True, timeout=…)``,
+    except that the timeout is actually enforced — see ``_kill_tree``.
+
+    ``env=None`` inherits the agent's environment, which is what every
+    caller did before this parameter existed. Pass an explicit mapping to
+    take an environment variable away from the child — see
+    ``cli_auth.env_without_api_keys``, which uses it so a stray
+    ``ANTHROPIC_API_KEY`` cannot override an OAuth login.
+
+    Blocking on purpose: callers inside async code must reach it through
+    ``run_cli`` below, never call it directly.
+    """
+    proc = subprocess.Popen(
+        list(args),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=None if env is None else dict(env),
+    )
+    try:
+        out, err = proc.communicate(input=stdin_data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        # THIS bound is what makes the timeout real. The pipe can still be
+        # held by a grandchild the kill did not reach in time, and an
+        # unbounded drain waits for that grandchild to exit — measured at
+        # the full 60s of a test child that was meant to be cut off at 2s.
+        # In production the same shape left a 120s dispatch running past
+        # 300s with the whole agent unresponsive.
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        raise subprocess.TimeoutExpired(
+            list(args), timeout, output=out, stderr=err
+        ) from None
+    return subprocess.CompletedProcess(list(args), proc.returncode, out, err)
+
+
+async def run_cli(
+    args: Sequence[str],
+    *,
+    stdin_data: bytes = b"",
+    timeout: float,
+    env: Optional[Mapping[str, str]] = None,
+) -> subprocess.CompletedProcess:
+    """``run_cli_sync`` on a worker thread.
+
+    The CLI providers used to call ``subprocess.run`` straight from a
+    coroutine, which pins the event loop for the whole dispatch: a Claude
+    ping measured at 38 seconds froze every other request for 38 seconds,
+    and a hung Codex call froze the agent outright.
+
+    Every subprocess these providers start belongs here — dispatches,
+    version probes and auth probes alike. The probes are individually
+    short, but they run inside the same coroutines, and "short" is a
+    property of a healthy machine rather than a guarantee.
+    """
+    return await asyncio.to_thread(
+        run_cli_sync, args, stdin_data=stdin_data, timeout=timeout, env=env
+    )
 
 
 def validate_prompt_size(prompt: str, max_bytes: int = MAX_PROMPT_BYTES) -> None:

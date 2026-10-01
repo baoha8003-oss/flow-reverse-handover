@@ -26,7 +26,7 @@ async def _handler(websocket) -> None:
         await websocket.send(
             json.dumps({"type": "callback_secret", "secret": flow_client.callback_secret})
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("failed to send callback_secret")
 
     try:
@@ -38,7 +38,7 @@ async def _handler(websocket) -> None:
                 continue
             try:
                 await flow_client.handle_message(data)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("error handling extension message")
     except websockets.ConnectionClosed:
         pass

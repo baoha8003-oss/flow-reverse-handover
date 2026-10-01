@@ -12,7 +12,7 @@ rationale.
 """
 from __future__ import annotations
 
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 
 class LLMError(RuntimeError):
@@ -24,12 +24,52 @@ class LLMError(RuntimeError):
     """
 
 
+def safe_error_message(resp: Any) -> str:
+    """The human-readable part of an OpenAI-shaped error body, and nothing else.
+
+    Deliberately narrow. An error response is one of the easiest places for
+    a credential to end up in a log, because an auth failure is exactly when
+    a server likes to echo what it was sent. So this reads only the two
+    fields OpenAI documents as prose and truncates them, rather than
+    formatting the body — anything unrecognised becomes a fixed string.
+
+    Lives here rather than in ``openai.py`` because the image path needs the
+    same treatment and importing a private function across modules to get it
+    is how a safety property quietly becomes optional.
+
+    ``resp`` is an ``httpx.Response``; typed loosely so ``base`` does not
+    have to import httpx just for an annotation.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return "(non-JSON body)"
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str):
+                return msg[:200]
+        msg = body.get("message")
+        if isinstance(msg, str):
+            return msg[:200]
+    return "(unrecognised body)"
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Every provider implementation conforms to this surface."""
 
     name: str
     supports_vision: bool
+
+    #: Whether this provider accepts an audio attachment. Distinct from
+    #: `supports_vision` because they genuinely diverge: on this stack only
+    #: Gemini takes audio, so subtitles and karaoke timing depend on one
+    #: provider in a way image work does not. Optional on the Protocol so a
+    #: provider that predates the attribute still conforms; readers use
+    #: ``getattr(provider, "supports_audio", False)``.
+    supports_audio: bool
 
     async def run(
         self,

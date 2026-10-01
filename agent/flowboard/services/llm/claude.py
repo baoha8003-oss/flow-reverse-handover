@@ -29,6 +29,8 @@ class ClaudeProvider:
 
     name: str = "claude"
     supports_vision: bool = True  # Haiku 4.5 / Sonnet / Opus all have vision
+    # The CLI takes images via `@path`; it has no audio transport at all.
+    supports_audio: bool = False
 
     async def run(
         self,
@@ -52,3 +54,7 @@ class ClaudeProvider:
 
     async def is_available(self) -> bool:
         return await claude_cli.is_available()
+
+    async def auth_mode(self) -> str:
+        """Which identity the CLI is signed in with: oauth / apikey / none."""
+        return await claude_cli.auth_mode()

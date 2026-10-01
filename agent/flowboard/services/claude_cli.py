@@ -12,14 +12,15 @@ and let the caller parse further (e.g. extract a fenced JSON block).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import subprocess
 from typing import Optional
 
+from .llm import cli_auth
 from .llm.cli_utils import (
     resolve_cli_binary,
+    run_cli,
     validate_attachment_paths,
     validate_prompt_size,
     DEFAULT_SUBPROCESS_TIMEOUT,
@@ -33,6 +34,8 @@ _CLI_BIN = "claude"
 
 # Cached availability probe. None = not probed yet.
 _available: Optional[bool] = None
+# Cached auth-mode probe, with the same lifetime as `_available`.
+_auth_mode: Optional[str] = None
 
 
 class ClaudeCliError(RuntimeError):
@@ -40,14 +43,13 @@ class ClaudeCliError(RuntimeError):
 
 
 async def _probe_available() -> bool:
-    # Try to resolve and probe claude binary
+    # Through `run_cli`, not `subprocess.run`: this is a coroutine, and a
+    # blocking call here pins the event loop. Bounded at 5s it only froze
+    # the agent briefly, which is exactly why it survived the round that
+    # fixed the same bug on the dispatch path.
     try:
         claude_bin = resolve_cli_binary(_CLI_BIN, CLI_PROBE_TIMEOUT)
-        result = subprocess.run(
-            [claude_bin, "--version"],
-            capture_output=True,
-            timeout=CLI_PROBE_TIMEOUT,
-        )
+        result = await run_cli([claude_bin, "--version"], timeout=CLI_PROBE_TIMEOUT)
         if result.returncode == 0:
             logger.info("claude_cli: SUCCESS - found claude at %s", claude_bin)
             return True
@@ -56,7 +58,7 @@ async def _probe_available() -> bool:
     except subprocess.TimeoutExpired:
         logger.warning("claude_cli: probe timed out")
         return False
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("claude_cli: probe failed - %s", e)
         return False
 
@@ -70,10 +72,45 @@ async def is_available(force: bool = False) -> bool:
     return _available
 
 
+async def auth_mode(force: bool = False) -> str:
+    """Which identity the CLI is signed in with: oauth / apikey / none.
+
+    Note what this is NOT: ``is_available`` only proves the binary answers
+    ``--version``, which it does just as happily when signed out. Callers
+    that need "can actually dispatch" want both.
+    """
+    global _auth_mode
+    if _auth_mode is None or force:
+        if not await is_available(force=force):
+            _auth_mode = cli_auth.NONE
+        else:
+            _auth_mode = await cli_auth.detect_auth_mode(_CLI_BIN)
+    return _auth_mode
+
+
+def _child_env() -> Optional[dict[str, str]]:
+    """Environment for a dispatch — scrubbed only when signed in via OAuth.
+
+    Makes "running on your subscription" true by construction rather than
+    by the CLI's internal precedence rules. Measured caveat in
+    ``cli_auth.env_without_api_keys``: on the version here the stored login
+    already wins on its own, so this is belt-and-braces, not a live fix.
+    When the key *is* the login the variable stays — stripping it there
+    could remove the only credential the user has.
+
+    Reads the cached probe rather than triggering one — an unresolved
+    identity means "leave the environment alone", the same as a key login.
+    """
+    if _auth_mode == cli_auth.OAUTH:
+        return cli_auth.env_without_api_keys(_CLI_BIN)
+    return None
+
+
 def reset_availability_cache() -> None:
-    """Testing hook."""
-    global _available
+    """Testing hook, and the Settings panel's re-check after a login."""
+    global _available, _auth_mode
     _available = None
+    _auth_mode = None
 
 
 async def run_claude(
@@ -151,20 +188,25 @@ async def run_claude(
                 args += ["--add-dir", parent]
         args += ["--permission-mode", "bypassPermissions"]
 
-    # Use synchronous subprocess.run() to avoid asyncio subprocess issues on Windows.
+    # `run_cli` rather than `subprocess.run`: asyncio's own subprocess
+    # support is unreliable on Windows, but a bare blocking call from a
+    # coroutine pins the event loop for the whole dispatch — a measured
+    # 38-second Claude ping froze every other request for 38 seconds. This
+    # runs the same synchronous call on a worker thread, and kills the
+    # `.cmd` shim's node child when the timeout fires so the timeout is
+    # actually enforced.
     try:
-        result = subprocess.run(
+        result = await run_cli(
             args,
-            input=full_prompt.encode("utf-8"),
-            capture_output=True,
+            stdin_data=full_prompt.encode("utf-8"),
             timeout=timeout,
-            text=False,
+            env=_child_env(),
         )
     except FileNotFoundError as exc:
         raise ClaudeCliError("claude CLI not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
         raise ClaudeCliError(f"claude CLI timed out after {timeout}s") from exc
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ClaudeCliError(f"claude CLI error: {exc}") from exc
 
     if result.returncode != 0:
