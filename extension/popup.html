@@ -106,7 +106,11 @@
 <body>
   <header>
     <span class="header-title">Flowboard Bridge</span>
-    <span class="header-version">v0.0.2</span>
+    <!-- Filled from the manifest at load: a hardcoded number here read
+         "v0.0.2" while the manifest said 0.0.12, and "which build is
+         actually loaded" was the one question a stale reload made
+         unanswerable. -->
+    <span class="header-version" id="header-version">v?</span>
   </header>
 
   <div class="section">
@@ -115,13 +119,18 @@
   </div>
 
   <div class="section">
-    <span class="section-label">Token</span>
-    <span class="section-value" id="token-row">none</span>
+    <span class="section-label">Flow tab</span>
+    <span class="section-value" id="flow-tab-row">chưa kiểm</span>
   </div>
 
   <div class="section">
     <span class="section-label">Requests</span>
     <span class="section-value" id="stats-row">0 · ✓ 0 · ✗ 0</span>
+  </div>
+
+  <div class="section">
+    <span class="section-label">Captcha</span>
+    <span class="section-value" id="captcha-row">0 · ✗ 0</span>
   </div>
 
   <div class="section" id="error-section" style="display:none">
@@ -131,7 +140,8 @@
 
   <div class="actions">
     <button id="btn-flow-tab">Open Flow tab</button>
-    <button id="btn-refresh">Refresh token</button>
+    <button id="btn-check-tab">Kiểm tra tab Flow</button>
+    <button id="btn-test-captcha">Test captcha</button>
     <button id="btn-toggle" class="disconnect">Disconnect</button>
   </div>
 

@@ -1,36 +1,54 @@
 /**
  * Flowboard Bridge — Chrome Extension Background Service Worker
  *
- * Connects to local Python agent via WebSocket (agent runs WS server).
- * Captures Bearer token and proxies API calls through the browser context.
+ * Connects to the local Python agent over a WebSocket (the agent runs the WS
+ * server) and runs Flow's `batchexecute` RPCs inside a signed-in
+ * flow.google.com tab, minting a single-use reCAPTCHA for each one.
+ *
+ * There is NO token here. Google moved Flow to flow.google.com in September
+ * 2026 and stopped minting the `Bearer ya29.…` this bridge used to sniff; the
+ * rewritten frontend signs every call with the session cookie plus a per-page
+ * `at` CSRF token that only the page can read. So the credential never leaves
+ * the tab, and nothing works headless — a signed-in Flow tab must stay open.
+ *
+ * The other two channels (Grok, Shopee) are plain cookie fetches to
+ * path-scoped endpoints, and never carry a Google credential.
  */
 
 const AGENT_WS_URL  = 'ws://127.0.0.1:9223';
 const CALLBACK_URL  = 'http://127.0.0.1:8101/api/ext/callback';
 
 let ws               = null;
-let flowKey          = null;
+
 let callbackSecret   = null; // Auth secret received from agent on WS connect
 let state            = 'off'; // off | idle | running
 let manualDisconnect = false;
 let metrics = {
-  tokenCapturedAt: null,
   requestCount:    0,
   successCount:    0,
   failedCount:     0,
   lastError:       null,
+  // Captcha counted apart from requests. A solve happens INSIDE a request,
+  // so folding it into requestCount would double-count the work and hide
+  // the one number that matters when generation stalls: whether the page is
+  // still handing back tokens at all.
+  captchaCount:    0,
+  captchaFailed:   0,
+  lastCaptchaAt:   null,
+  lastCaptchaError: null,
 };
 
-const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
-
-// ─── URL → Log Type Classifier ─────────────────────────────
-
-function classifyUrl(url) {
-  if (url.includes('batchGenerateImages'))     return 'GEN_IMG';
-  if (url.includes('batchAsyncGenerateVideo')) return 'GEN_VID';
-  if (url.includes('batchCheckAsync'))         return 'POLL';
-  return 'API';
-}
+// Both hosts. `flow.google.com` is where the app lives; the `labs.google`
+// patterns are for a tab someone pinned before the move, which still
+// redirects. Every tab lookup in this file goes through this list — a bridge
+// that hardcodes one hostname breaks silently the day the product moves,
+// which is exactly what happened here (a 206-hour-old token, while the user
+// was signed in the whole time).
+const flowUrls = [
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+  'https://flow.google.com/*',
+];
 
 // ─── Request Log (last 50 entries) ─────────────────────────
 
@@ -67,84 +85,11 @@ async function init() {
   // to persist it here, but Google profile fields (name + email) are
   // PII and chrome.storage.local is plaintext + readable by other
   // extensions on the profile that hold the `storage` permission.
-  // The agent replays user_info on every WS reconnect anyway via
-  // fetchAndPushUserInfo(token), so persistence buys nothing.
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret']);
-  if (data.flowKey)        flowKey        = data.flowKey;
+  const data = await chrome.storage.local.get(['metrics', 'callbackSecret']);
   if (data.metrics)        Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
   connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
-}
-
-// ─── Token Capture ──────────────────────────────────────────
-
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    if (!details?.requestHeaders?.length) return;
-    const authHeader = details.requestHeaders.find(
-      (h) => h.name?.toLowerCase() === 'authorization',
-    );
-    const value = authHeader?.value || '';
-    if (!value.startsWith('Bearer ya29.')) return;
-
-    const token = value.replace(/^Bearer\s+/i, '').trim();
-    if (!token) return;
-
-    // Always update — even if same token string, refresh the timestamp
-    const tokenChanged = flowKey !== token;
-    flowKey = token;
-    metrics.tokenCapturedAt = Date.now();
-    chrome.storage.local.set({ flowKey, metrics });
-
-    // Only emit on the WS when the token actually rotated. The listener
-    // fires on EVERY outbound aisandbox-pa request — and the agent's
-    // own poll loops generate dozens per minute. Re-sending the same
-    // string each time pushed the agent into an effective infinite
-    // /v1/credits refresh loop (one credits GET per poll). The agent
-    // side has a defensive dedupe too, but quiet at the source first.
-    if (tokenChanged) {
-      console.log('[Flowboard] Bearer token captured');
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-      }
-      // Resolve the user's identity (email/name/picture) once per token —
-      // saves the popup + AccountPanel from showing "Connected via
-      // extension" placeholders. The token already has the userinfo.email
-      // + userinfo.profile scopes Flow needs anyway, so this is a free
-      // call. Errors are non-fatal and silent.
-      fetchAndPushUserInfo(token);
-    }
-  },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
-  ['requestHeaders', 'extraHeaders'],
-);
-
-let cachedUserInfo = null;
-
-async function fetchAndPushUserInfo(token) {
-  try {
-    const resp = await fetch(
-      'https://www.googleapis.com/oauth2/v2/userinfo',
-      { headers: { authorization: `Bearer ${token}` } },
-    );
-    if (!resp.ok) {
-      console.warn('[Flowboard] userinfo fetch returned', resp.status);
-      return;
-    }
-    const info = await resp.json();
-    // In-memory only — DO NOT persist to chrome.storage.local. PII
-    // there is plaintext on disk and readable by other extensions
-    // with the `storage` permission. Lifetime = service-worker
-    // lifetime; rebuilt on next token rotation if the SW recycles.
-    cachedUserInfo = info;
-    console.log('[Flowboard] userinfo captured for', info?.email || '<no email>');
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'user_info', userInfo: info }));
-    }
-  } catch (e) {
-    console.warn('[Flowboard] userinfo fetch failed:', e?.message || e);
-  }
 }
 
 // ─── WebSocket to Agent ─────────────────────────────────────
@@ -167,28 +112,17 @@ function connectToAgent() {
     chrome.alarms.clear('reconnect');
     setState('idle');
 
-    const tokenAge = flowKey && metrics.tokenCapturedAt
-      ? Date.now() - metrics.tokenCapturedAt
-      : null;
-
+    // No token to announce any more: Flow signs its own calls inside the tab.
+    // What the agent needs to know is which build is here — without it,
+    // "reload the extension" and "the extension was reloaded" are
+    // indistinguishable from the agent side, which cost an afternoon of blind
+    // retries. Whether that tab can actually sign anything is a separate
+    // question, answered on demand by the `flow_probe` method.
     ws.send(JSON.stringify({
       type: 'extension_ready',
-      flowKeyPresent: !!flowKey,
-      tokenAge,
+      version: chrome.runtime.getManifest().version,
+      transport: 'batch',
     }));
-
-    // Resend token immediately so agent can start without waiting for a capture
-    if (flowKey) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
-    }
-    // Replay cached userinfo so the agent's AccountPanel populates on
-    // reconnect without waiting for the next token rotation. If we
-    // never resolved one yet but a token IS present, kick off a fetch.
-    if (cachedUserInfo) {
-      ws.send(JSON.stringify({ type: 'user_info', userInfo: cachedUserInfo }));
-    } else if (flowKey) {
-      fetchAndPushUserInfo(flowKey);
-    }
   };
 
   ws.onmessage = async ({ data }) => {
@@ -202,40 +136,61 @@ function connectToAgent() {
       } else if (msg.type === 'pong') {
         // keepalive response — no-op
       } else if (msg.type === 'logout') {
-        // Agent's /api/auth/logout invoked — drop in-memory identity
-        // so the next reconnect picks up fresh credentials. Don't
-        // touch chrome.storage (we don't persist identity there
-        // anyway, but be explicit). The WS stays open; agent will
-        // re-greet when the user logs back in.
-        console.log('[Flowboard] logout requested by agent');
-        cachedUserInfo = null;
-        flowKey = null;
-      } else if (msg.type === 'please_resend_userinfo') {
-        // Agent's /api/auth/scan asks us to re-fetch userinfo when
-        // its own cache is empty (e.g. agent restarted, or user
-        // clicked "Scan extension" before WS finished its first
-        // round-trip). If we have a cached profile, replay it
-        // immediately; otherwise refetch from Google's userinfo
-        // endpoint with whatever Bearer token we currently hold.
-        if (cachedUserInfo) {
-          ws.send(JSON.stringify({ type: 'user_info', userInfo: cachedUserInfo }));
-        } else if (flowKey) {
-          fetchAndPushUserInfo(flowKey);
-        } else {
-          console.log('[Flowboard] please_resend_userinfo: no token captured yet');
-        }
-      } else if (msg.method === 'api_request') {
-        await handleApiRequest(msg);
+        // Nothing left to drop: this worker holds no Google credential. The
+        // session lives in the browser's own cookie jar, so signing out is
+        // something the user does on flow.google.com, not something the agent
+        // can do on their behalf. Acknowledged rather than silently ignored.
+        console.log('[Flowboard] logout requested — no credential is held here');
+      } else if (msg.method === 'batch_rpc') {
+        await handleBatchRpc(msg);
+      } else if (msg.method === 'flow_probe') {
+        sendToAgent({ id: msg.id, result: await runFlowProbe() });
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
+      } else if (msg.method === 'grok_fetch') {
+        await handleGrokFetch(msg);
+      } else if (msg.method === 'solve_captcha') {
+        // The solver already ran per request; what it never had was a way to
+        // be exercised on its own. Without that, "generation is stuck" and
+        // "the page stopped issuing captcha tokens" look identical from the
+        // agent side, and the second one is the actionable half.
+        const action = (msg.params && msg.params.action) || 'VIDEO_GENERATION';
+        const started = Date.now();
+        let result;
+        try {
+          result = await solveCaptcha(msg.id, action);
+        } catch (e) {
+          result = { error: e?.message || 'CAPTCHA_FAILED' };
+        }
+        const ok = !!(result && result.token && !result.error);
+        metrics.captchaCount += 1;
+        metrics.lastCaptchaAt = Date.now();
+        if (ok) {
+          metrics.lastCaptchaError = null;
+        } else {
+          metrics.captchaFailed += 1;
+          metrics.lastCaptchaError = (result && result.error) || 'NO_TOKEN';
+        }
+        sendToAgent({
+          id: msg.id,
+          result: {
+            ok,
+            action,
+            elapsedMs: Date.now() - started,
+            // The token itself is never sent back or logged. What the caller
+            // needs is whether one was issued and how long it took; the value
+            // is a credential and belongs only in the request that uses it.
+            tokenLength: ok ? String(result.token).length : 0,
+            error: ok ? null : metrics.lastCaptchaError,
+          },
+        });
       } else if (msg.method === 'get_status') {
         sendToAgent({
           id: msg.id,
           result: {
             state,
-            flowKeyPresent: !!flowKey,
+            transport: 'batch',
             manualDisconnect,
-            tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
             metrics,
           },
         });
@@ -291,122 +246,224 @@ function sendToAgent(msg) {
     });
     return;
   }
-  // Non-response messages (ping, status, token_captured)
+  // Non-response messages (ping, status)
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   }
 }
 
-// ─── API Request Proxy ──────────────────────────────────────
+// ─── Page-context RPC runner (the batchexecute transport) ───
+//
+// Flow's rewritten frontend signs every call with the session cookie plus a
+// per-page `at` token, and a generate also carries a SINGLE-USE reCAPTCHA. None
+// of that can be replayed from this service worker, so the request has to be
+// issued by the Flow page itself: mint a fresh captcha through the grecaptcha
+// bridge, then run the batchexecute POST in the page's MAIN world, where
+// `at` / `f.sid` / `bl` live.
+//
+// Ported from flowkit (https://github.com/crisng95/flowkit, MIT) v1.2.0
+// commit 57b52e6, extension/background.js. The MAIN-world function must stay
+// SELF-CONTAINED — it is serialised across the world boundary, so a reference
+// to anything in this file comes back as NO_INJECTION_RESULT.
 
-async function handleApiRequest(msg) {
+const CAPTCHA_SLOT = '__CAPTCHA__';
+const MAX_RPC_TEXT = 32000000; // the project listing alone is past 17 MB
+
+async function runBatchRpc(cmd) {
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  let candidate = tabs.find((t) => !t.discarded) || tabs[0];
+  if (!candidate) {
+    // No Flow tab — open one and give the app a moment to boot, otherwise
+    // WIZ_global_data is not on the page yet and `at` comes back empty. Keep
+    // the exact created tab id so redirects/stale tabs cannot hijack recovery.
+    let opened;
+    try {
+      opened = await chrome.tabs.create({ url: FLOW_URL, active: false });
+      await sleep(5000);
+      candidate = opened?.id ? await chrome.tabs.get(opened.id).catch(() => null) : null;
+    } catch (e) {
+      return { error: e?.message || 'NO_FLOW_TAB' };
+    }
+    if (!candidate) return { error: 'NO_FLOW_TAB' };
+  }
+  // Chrome discards backgrounded tabs; executeScript throws on a dead one.
+  const tab = await reviveTabIfNeeded(candidate);
+  if (!tab) return { error: 'FLOW_TAB_DISCARDED' };
+
+  let freq = cmd.freq;
+  if (cmd.captchaAction) {
+    const solved = await solveCaptcha(cmd.id, cmd.captchaAction);
+    if (!solved?.token) return { error: `CAPTCHA_FAILED: ${solved?.error || 'no token'}` };
+    freq = freq.split(CAPTCHA_SLOT).join(solved.token);
+  }
+
+  const [injected] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: 'MAIN',
+    args: [cmd.rpcid, freq, MAX_RPC_TEXT, cmd.match || null],
+    func: async (rpcid, freqStr, maxText, match) => {
+      const wiz = globalThis.WIZ_global_data || {};
+      const at = wiz.SNlM0e;
+      const sid = wiz.FdrFJe;
+      const bl = wiz.cfb2h;
+      if (!at) return { error: 'NO_AT_TOKEN' };
+      const reqid = Math.floor(Math.random() * 900000) + 100000;
+      // Match Flow's own WIZ metadata. GEM_PIX_2 (Nano Banana Pro) rejects
+      // image generation when source-path is missing even though Lite may not.
+      const sourcePath = location.pathname || '/';
+      const hl = (document.documentElement.lang || navigator.language || 'en').split('-')[0];
+      const url =
+        `/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(rpcid)}` +
+        `&source-path=${encodeURIComponent(sourcePath)}` +
+        `&bl=${encodeURIComponent(bl || '')}&f.sid=${encodeURIComponent(sid || '')}` +
+        `&hl=${encodeURIComponent(hl)}&_reqid=${reqid}&rt=c`;
+      const resp = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'x-same-domain': '1',
+        },
+        body: new URLSearchParams({ 'f.req': freqStr, at }),
+      });
+      const text = await resp.text();
+      // The project listing is tens of megabytes and all we ever want from it
+      // is one entry. Cutting it down here keeps that payload inside the tab
+      // instead of pushing it through the bridge on every poll.
+      if (match) {
+        const found = text.indexOf(match);   // not `at` — that is the CSRF token above
+        return {
+          status: resp.status,
+          matched: found !== -1,
+          text: found === -1 ? '' : text.slice(found, found + 800),
+        };
+      }
+      return { status: resp.status, text: text.slice(0, maxText) };
+    },
+  });
+
+  return injected?.result || { error: 'NO_INJECTION_RESULT' };
+}
+
+async function handleBatchRpc(msg) {
   const { id, params } = msg;
-  const { url, method, headers, body, captchaAction } = params || {};
-
-  if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) {
-    sendToAgent({ id, status: 400, error: 'INVALID_URL' });
+  const { rpcid, freq, captchaAction, match } = params || {};
+  if (!rpcid || !freq) {
+    sendToAgent({ id, status: 400, error: 'INVALID_BATCH_RPC' });
     return;
   }
 
   setState('running');
   const hasCaptcha = !!captchaAction;
   if (hasCaptcha) metrics.requestCount++;
-
-  addRequestLog({
-    id,
-    type:   classifyUrl(url),
-    time:   new Date().toISOString(),
-    status: 'processing',
-    url,
-  });
+  // Polls and listing lookups run constantly; only the generates are worth a
+  // row in the log the popup shows.
+  if (hasCaptcha) {
+    addRequestLog({
+      id,
+      type: `RPC:${rpcid}`,
+      time: new Date().toISOString(),
+      status: 'processing',
+      error: null,
+      outputUrl: null,
+      url: rpcid,
+      // The envelope, truncated. NEVER the `at` token or a captcha token —
+      // those live in the page and in the substituted freq respectively, and
+      // the substitution happens after this line.
+      payloadSummary: freq.slice(0, 200),
+    });
+  }
 
   try {
-    // Step 0: Fail fast if we have no bearer token. Avoids burning a reCAPTCHA
-    // solve (rate-limited + single-use) only to discover later that we can't
-    // send the request.
-    if (!flowKey) {
-      sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
-      chrome.storage.local.set({ metrics });
-      updateRequestLog(id, { status: 'failed', error: 'NO_FLOW_KEY' });
-      setState('idle');
-      return;
-    }
-
-    // Step 1: Solve captcha if needed
-    let captchaToken = null;
-    if (captchaAction) {
-      const captchaResult = await solveCaptcha(id, captchaAction);
-      captchaToken = captchaResult?.token || null;
-      if (!captchaToken) {
-        const err = captchaResult?.error || 'CAPTCHA_FAILED';
-        console.error(`[Flowboard] Captcha failed for ${captchaAction}: ${err}`);
-        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
-        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
-        chrome.storage.local.set({ metrics });
-        updateRequestLog(id, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
-        setState('idle');
-        return;
-      }
-    }
-
-    // Step 2: Inject captcha token into body clone if present
-    let finalBody = body;
-    if (captchaToken && finalBody) {
-      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
-      if (finalBody.clientContext?.recaptchaContext) {
-        finalBody.clientContext.recaptchaContext.token = captchaToken;
-      }
-      if (finalBody.requests && Array.isArray(finalBody.requests)) {
-        for (const req of finalBody.requests) {
-          if (req.clientContext?.recaptchaContext) {
-            req.clientContext.recaptchaContext.token = captchaToken;
-          }
-        }
-      }
-    }
-
-    const fetchHeaders = { ...(headers || {}), authorization: `Bearer ${flowKey}` };
-
-    const response = await fetch(url, {
-      method:      method || 'POST',
-      headers:     fetchHeaders,
-      credentials: 'include',
-      body:        method === 'GET' ? undefined : JSON.stringify(finalBody),
-    });
-
-    const responseText = await response.text();
-    let responseData;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch {
-      responseData = responseText;
-    }
-
-    sendToAgent({ id, status: response.status, data: responseData });
-
-    if (response.ok) {
-      if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
-      updateRequestLog(id, { status: 'success', httpStatus: response.status });
+    const out = await runBatchRpc({ id, rpcid, freq, captchaAction, match });
+    if (out.error) {
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = out.error; }
+      if (hasCaptcha) updateRequestLog(id, { status: 'failed', error: out.error });
+      sendToAgent({ id, status: 502, error: out.error });
     } else {
-      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
-      updateRequestLog(id, { status: 'failed', httpStatus: response.status, error: `API_${response.status}` });
+      if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
+      if (hasCaptcha) {
+        updateRequestLog(id, {
+          status: 'success',
+          httpStatus: out.status,
+          responseSummary: (out.text || '').slice(0, 300),
+        });
+      }
+      sendToAgent({ id, status: out.status, data: out.text });
     }
   } catch (e) {
-    sendToAgent({ id, status: 500, error: e.message || 'API_REQUEST_FAILED' });
-    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message || 'API_REQUEST_FAILED'; }
-    updateRequestLog(id, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
+    const err = e?.message || 'BATCH_RPC_FAILED';
+    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = err; }
+    if (hasCaptcha) updateRequestLog(id, { status: 'failed', error: err });
+    sendToAgent({ id, status: 500, error: err });
   }
 
   chrome.storage.local.set({ metrics });
   setState('idle');
 }
 
-// ─── Token Refresh (minimal) ────────────────────────────────
+// ─── Flow tab probe ─────────────────────────────────────────────
+//
+// Answers the one question the agent can no longer answer for itself: is there
+// a signed-in Flow tab that can sign an RPC? Before the migration the agent
+// held a Bearer token and could tell by using it; now the credential never
+// leaves the page, so "connected" and "able to generate" became two different
+// things with no way to distinguish them.
+//
+// Reads PRESENCE, never values: whether `at` exists, not what it is.
+
+async function runFlowProbe() {
+  const tabs = await chrome.tabs.query({ url: flowUrls });
+  const candidate = tabs.find((t) => !t.discarded) || tabs[0];
+  if (!candidate) return { flowTabPresent: false, atTokenPresent: false, error: 'NO_FLOW_TAB' };
+  const tab = await reviveTabIfNeeded(candidate);
+  if (!tab) return { flowTabPresent: true, atTokenPresent: false, error: 'FLOW_TAB_DISCARDED' };
+
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: () => {
+        const wiz = globalThis.WIZ_global_data || {};
+        // Which WIZ key carries the signed-in email is not known, so report
+        // whether ANY value looks like one rather than guessing a key name.
+        // Only the boolean travels — never the address.
+        let emailPresent = false;
+        try {
+          emailPresent = Object.values(wiz).some(
+            (v) => typeof v === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v),
+          );
+        } catch { /* a hostile WIZ shape is not worth failing the probe over */ }
+        return {
+          atTokenPresent: !!wiz.SNlM0e,
+          sourcePath: location.pathname || '/',
+          host: location.host,
+          emailPresent,
+        };
+      },
+    });
+    const result = injected?.result;
+    if (!result) return { flowTabPresent: true, atTokenPresent: false, error: 'NO_INJECTION_RESULT' };
+    return { flowTabPresent: true, ...result };
+  } catch (e) {
+    return { flowTabPresent: true, atTokenPresent: false, error: e?.message || 'PROBE_FAILED' };
+  }
+}
+
+
+
+
+
+
+
+// ─── Flow tab ────────────────────────────────
 
 let _openingFlowTab = false;
 
-const FLOW_URL = 'https://labs.google/fx/tools/flow';
+// Every RPC runs inside this tab now, so it is not an implementation detail
+// of a token refresh any more — it is where the whole transport lives.
+// Nothing here works headless.
+const FLOW_URL = 'https://flow.google.com/';
 
 /**
  * Open a Flow tab even when Chrome has zero windows. `chrome.tabs.create`
@@ -428,37 +485,6 @@ async function openFlowTabResilient(active = false) {
       state: 'minimized',
     });
     return win.tabs?.[0] ?? null;
-  }
-}
-
-async function captureTokenFromFlowTab() {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-  });
-
-  if (!tabs.length) {
-    if (_openingFlowTab) return;
-    _openingFlowTab = true;
-    try {
-      console.log('[Flowboard] No Flow tab — opening in background');
-      await openFlowTabResilient(false);
-    } catch (e) {
-      console.error('[Flowboard] Failed to open Flow tab:', e);
-    } finally {
-      _openingFlowTab = false;
-    }
-    return;
-  }
-
-  try {
-    // Trigger a credentialed request so the page re-issues an Authorization header
-    await chrome.scripting.executeScript({
-      target: { tabId: tabs[0].id },
-      func:   () => fetch('/fx/tools/flow', { credentials: 'include' }),
-    });
-    console.log('[Flowboard] Token refresh triggered on Flow tab');
-  } catch (e) {
-    console.error('[Flowboard] Token refresh failed:', e);
   }
 }
 
@@ -580,29 +606,59 @@ async function solveCaptcha(requestId, captchaAction) {
   }
 }
 
-// ─── TRPC Request Proxy ─────────────────────────────────────
+// Endpoints this bridge may call with the user's own session cookies.
+//
+// Each entry is a path prefix, not a domain: `grok.com/*` would let the agent
+// reach account settings, and `labs.google/fx/api/trpc/` alone already covers
+// mutations like account.deleteAccount that should stay server-gated.
+//
+// `bearer` says whether the captured Google access token may ride along.
+// It must be true for Flow ONLY — sending it to grok.com or shopee.vn would
+// hand a third party the credential this whole tool depends on.
+// Two entries, and no `bearer` flag any more: there is no Google credential in
+// this worker to attach to anything. Flow's own tRPC paths left this list
+// because the migration unauthenticated them — Flow is reached through
+// `batch_rpc`, which runs inside the signed-in page instead of proxying from
+// here. `upload-video` went with them (see the Edit Video gap in
+// plans/reports/gaps-260918-1729-flow-batch-migration.md).
+const SESSION_CHANNELS = [
+  // Grok generates from the logged-in grok.com session, the same way the
+  // packaged tool does — it drives a real browser to reach these very paths.
+  { prefix: 'https://grok.com/rest/' },
+  // Shopee's own product API, which answers properly only for a signed-in
+  // session. That is why scraping the public page returns nothing useful.
+  { prefix: 'https://shopee.vn/api/v4/' },
+];
+
+function channelFor(url) {
+  if (!url) return null;
+  return SESSION_CHANNELS.find((c) => url.startsWith(c.prefix)) || null;
+}
 
 async function handleTrpcRequest(msg) {
   const { id, params } = msg;
   const { url, method = 'POST', headers = {}, body } = params;
 
-  // Tightly scoped to TRPC endpoints — prevents the agent from navigating to
-  // arbitrary labs.google paths (e.g. /fx/api/trpc/account.deleteAccount would
-  // also match /fx/api/trpc/ but account-level mutations should be gated server
-  // side if they're ever needed).
-  if (!url || !url.startsWith('https://labs.google/fx/api/trpc/')) {
+  const channel = channelFor(url);
+  if (!channel) {
     sendToAgent({ id, error: 'INVALID_TRPC_URL' });
     return;
   }
 
   setState('running');
-  // TRPC calls are silent — don't add to request log, don't bump metrics
+  // Session calls are silent — don't add to request log, don't bump metrics
 
   const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
-  if (flowKey) {
-    fetchHeaders['authorization'] = `Bearer ${flowKey}`;
-  }
+  // No Authorization header on this path, ever. It used to carry the captured
+  // Google token for Flow's own tRPC endpoints; those left this bridge with the
+  // migration, and the two channels that remain are third-party sites that must
+  // never see a Google credential.
 
+  // No redirect-chasing branch any more. It existed for Flow's
+  // `media.getMediaUrlRedirect`, which answered a media id with a 302 to a
+  // signed storage.googleapis.com url that could not be followed from an
+  // extension origin. That endpoint went with the migration; the batch path
+  // asks the `as29s` RPC instead and gets the url in plain JSON.
   try {
     const resp = await fetch(url, {
       method,
@@ -610,11 +666,101 @@ async function handleTrpcRequest(msg) {
       body:    body ? JSON.stringify(body) : undefined,
       credentials: 'include',
     });
-    const data = await resp.json();
-    sendToAgent({ id, status: resp.status, data });
+    const finalUrl = resp.url && resp.url !== url ? resp.url : null;
+    const contentType = resp.headers.get('content-type') || '';
+    const data = contentType.includes('application/json') ? await resp.json() : null;
+    sendToAgent({ id, status: resp.status, data, finalUrl, contentType });
   } catch (e) {
-    console.error('[Flowboard] tRPC request failed:', e);
-    sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+    console.error('[Flowboard] session request failed:', e);
+    sendToAgent({ id, error: e.message || 'SESSION_FETCH_FAILED' });
+  } finally {
+    setState('idle');
+  }
+}
+
+// ─── Grok (page-context bridge) ─────────────────────────────
+//
+// Grok's generation calls cannot be made from here. Its endpoints want
+// per-session headers only the running app knows, and they answer with a
+// stream of concatenated JSON rather than one document. So the request is
+// handed to a content script on an open grok.com tab, which runs it in the
+// page — the same thing the packaged tool achieves by driving Chrome over CDP.
+
+const GROK_TAB_URLS = ['https://grok.com/*'];
+
+// grok.com stamps its own API calls with per-session headers (a Statsig id
+// among them) that the page computes at runtime. A request without them is
+// answered 403 even from inside the page, which is why the packaged tool
+// passes `statsigHeaders` into the script it injects — it harvested them
+// first.
+//
+// Rather than recompute anything, watch what grok's own client sends and
+// reuse it. Same trick the Google token capture above already relies on.
+let grokHeaders = {};
+
+// Never copy these: the browser attaches cookies itself, and replaying a
+// stale length/encoding against a different body corrupts the request.
+const GROK_HEADER_SKIP = new Set([
+  'cookie',
+  'content-length',
+  'content-type',
+  'accept-encoding',
+  'host',
+  'connection',
+]);
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const seen = {};
+    for (const h of details.requestHeaders || []) {
+      const name = h.name.toLowerCase();
+      if (GROK_HEADER_SKIP.has(name)) continue;
+      // The session-identifying ones are all x-* plus the app's own referer.
+      if (name.startsWith('x-') || name === 'referer' || name === 'origin') {
+        if (h.value) seen[name] = h.value;
+      }
+    }
+    // x-xai-request-id is per-call; keeping it would replay one id forever.
+    delete seen['x-xai-request-id'];
+    if (Object.keys(seen).length) grokHeaders = seen;
+  },
+  { urls: ['https://grok.com/rest/*'] },
+  ['requestHeaders', 'extraHeaders'],
+);
+
+async function handleGrokFetch(msg) {
+  const { id, params } = msg;
+  const { url, method = 'POST', body, stream = false } = params || {};
+
+  const tabs = await chrome.tabs.query({ url: GROK_TAB_URLS });
+  if (!tabs.length) {
+    // Not an error worth retrying — the user has to be signed in and present.
+    sendToAgent({ id, error: 'GROK_NO_TAB' });
+    return;
+  }
+
+  setState('running');
+  try {
+    const result = await chrome.tabs.sendMessage(tabs[0].id, {
+      type: 'GROK_FETCH',
+      requestId: `grok-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      url,
+      method,
+      body,
+      stream,
+      // Whatever grok's own client last sent. Empty until the page has made
+      // one API call of its own, which is why a fresh tab can still 403.
+      sessionHeaders: grokHeaders,
+    });
+    if (!result) {
+      sendToAgent({ id, error: 'GROK_NO_RESPONSE' });
+      return;
+    }
+    sendToAgent({ id, ...result });
+  } catch (e) {
+    // Usually means the content script isn't in that tab yet (it loads at
+    // document_idle) or the tab was discarded.
+    sendToAgent({ id, error: (e && e.message) || 'GROK_BRIDGE_UNREACHABLE' });
   } finally {
     setState('idle');
   }
@@ -641,18 +787,57 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === 'STATUS') {
     reply({
       connected:       ws?.readyState === WebSocket.OPEN,
-      flowKeyPresent:  !!flowKey,
+      transport:       'batch',
       manualDisconnect,
-      tokenAge:        metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
       metrics: {
         requestCount: metrics.requestCount,
         successCount: metrics.successCount,
         failedCount:  metrics.failedCount,
         lastError:    metrics.lastError,
+        captchaCount:  metrics.captchaCount,
+        captchaFailed: metrics.captchaFailed,
+        lastCaptchaError: metrics.lastCaptchaError,
       },
       state,
     });
     return true;
+  }
+
+  if (msg.type === 'TEST_CAPTCHA') {
+    // Runs the same solver a real generation uses, on the same Flow tab, and
+    // reports only whether a token came back. Answers the question the popup
+    // could not answer before: is the page still issuing captcha tokens, or is
+    // generation stalling for some other reason entirely?
+    (async () => {
+      const action = msg.action || 'VIDEO_GENERATION';
+      const started = Date.now();
+      let result;
+      try {
+        result = await solveCaptcha(`test-${started}`, action);
+      } catch (e) {
+        result = { error: e?.message || 'CAPTCHA_FAILED' };
+      }
+      const ok = !!(result && result.token && !result.error);
+      metrics.captchaCount += 1;
+      metrics.lastCaptchaAt = Date.now();
+      if (ok) {
+        metrics.lastCaptchaError = null;
+      } else {
+        metrics.captchaFailed += 1;
+        metrics.lastCaptchaError = (result && result.error) || 'NO_TOKEN';
+      }
+      chrome.storage.local.set({ metrics });
+      // The token never leaves this function: its length says the solver
+      // worked, and the value is a credential.
+      reply({
+        ok,
+        action,
+        elapsedMs: Date.now() - started,
+        tokenLength: ok ? String(result.token).length : 0,
+        error: ok ? null : metrics.lastCaptchaError,
+      });
+    })();
+    return true;  // async reply
   }
 
   if (msg.type === 'DISCONNECT') {
@@ -676,7 +861,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'OPEN_FLOW_TAB') {
     chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+      url: flowUrls,
     }).then(async (tabs) => {
       try {
         if (tabs.length) {
@@ -694,10 +879,13 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return true;
   }
 
-  if (msg.type === 'REFRESH_TOKEN') {
-    captureTokenFromFlowTab()
-      .then(() => reply({ ok: true }))
-      .catch((e) => reply({ error: e.message }));
+  if (msg.type === 'CHECK_FLOW_TAB') {
+    // Replaces "Refresh token". There is no token to refresh; what someone
+    // staring at a stalled run needs to know is whether a Flow tab is open and
+    // able to sign an RPC at all. Reads presence, never values.
+    runFlowProbe()
+      .then((r) => reply(r))
+      .catch((e) => reply({ error: e?.message || 'PROBE_FAILED' }));
     return true;
   }
 
@@ -705,3 +893,4 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 });
 
 console.log('[Flowboard] Extension loaded');
+

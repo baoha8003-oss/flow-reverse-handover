@@ -22,10 +22,13 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     }
   };
 
+  // Must outlive injected.js's 22s grecaptcha wait plus the mint itself —
+  // otherwise this reports CONTENT_TIMEOUT for a token that was about to
+  // arrive, and the caller burns a retry on a healthy page.
   const timer = setTimeout(() => {
     window.removeEventListener('CAPTCHA_RESULT', handler);
     reply({ error: 'CONTENT_TIMEOUT' });
-  }, 25000);
+  }, 30000);
 
   window.addEventListener('CAPTCHA_RESULT', handler);
 

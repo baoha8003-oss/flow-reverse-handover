@@ -1,3 +1,7 @@
+let _testingCaptcha = false;
+let _probing = false;
+let _lastProbe = null;
+
 /**
  * Flowboard Bridge — Popup UI
  * Polls background status every 1.5 s and renders it.
@@ -5,12 +9,14 @@
 
 let _manualDisconnect = false;
 
-function formatTokenAge(ms) {
-  if (ms === null || ms === undefined) return 'none';
-  const s = Math.floor(ms / 1000);
-  if (s < 60)   return `captured ${s} s ago`;
-  if (s < 3600) return `captured ${Math.floor(s / 60)} m ago`;
-  return `captured ${Math.floor(s / 3600)} h ago`;
+// Never a token age any more: there is no token. What matters is whether the
+// Flow tab can sign an RPC, which only a probe can answer.
+function describeFlowTab(probe) {
+  if (!probe) return 'chưa kiểm';
+  if (probe.error && !probe.atTokenPresent) {
+    return probe.flowTabPresent ? `lỗi: ${probe.error}` : 'chưa mở tab Flow';
+  }
+  return probe.atTokenPresent ? 'đã đăng nhập ✓' : 'có tab, chưa đăng nhập';
 }
 
 function render(status) {
@@ -31,14 +37,25 @@ function render(status) {
     dotEl.textContent = '● connected';
   }
 
-  // Token
-  document.getElementById('token-row').textContent =
-    status.flowKeyPresent ? formatTokenAge(status.tokenAge) : 'none';
+  // Flow tab — filled by the probe, not by the poll: it costs an
+  // executeScript into the page, so it runs on demand rather than every 1.5 s.
+  if (!_probing && _lastProbe) {
+    document.getElementById('flow-tab-row').textContent = describeFlowTab(_lastProbe);
+  }
 
   // Stats
   const m = status.metrics || {};
   document.getElementById('stats-row').textContent =
     `${m.requestCount || 0} · ✓ ${m.successCount || 0} · ✗ ${m.failedCount || 0}`;
+
+  // Captcha. Shown next to requests rather than inside them: a solve happens
+  // inside a request, so a stalled generation and a page that stopped issuing
+  // tokens look identical in the request counters alone.
+  const captchaEl = document.getElementById('captcha-row');
+  if (!_testingCaptcha) {
+    const base = `${m.captchaCount || 0} · ✗ ${m.captchaFailed || 0}`;
+    captchaEl.textContent = m.lastCaptchaError ? `${base} · ${m.lastCaptchaError}` : base;
+  }
 
   // Error
   const errSection = document.getElementById('error-section');
@@ -82,8 +99,43 @@ document.getElementById('btn-flow-tab').addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'OPEN_FLOW_TAB' });
 });
 
-document.getElementById('btn-refresh').addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'REFRESH_TOKEN' });
+document.getElementById('btn-check-tab').addEventListener('click', () => {
+  const row = document.getElementById('flow-tab-row');
+  const btn = document.getElementById('btn-check-tab');
+  _probing = true;
+  btn.disabled = true;
+  row.textContent = 'đang kiểm…';
+  chrome.runtime.sendMessage({ type: 'CHECK_FLOW_TAB' }, (probe) => {
+    btn.disabled = false;
+    _probing = false;
+    _lastProbe = chrome.runtime.lastError ? null : probe;
+    row.textContent = chrome.runtime.lastError
+      ? 'không hỏi được background'
+      : describeFlowTab(probe);
+  });
+});
+
+// While a test is in flight the poll must not overwrite its result line.
+document.getElementById('btn-test-captcha').addEventListener('click', () => {
+  const btn = document.getElementById('btn-test-captcha');
+  const row = document.getElementById('captcha-row');
+  _testingCaptcha = true;
+  btn.disabled = true;
+  row.textContent = 'testing…';
+  chrome.runtime.sendMessage({ type: 'TEST_CAPTCHA' }, (reply) => {
+    btn.disabled = false;
+    if (chrome.runtime.lastError || !reply) {
+      row.textContent = 'test failed: no reply from background';
+      _testingCaptcha = false;
+      return;
+    }
+    // Token length, never the token.
+    row.textContent = reply.ok
+      ? `ok · ${reply.elapsedMs} ms · token ${reply.tokenLength} chars`
+      : `failed · ${reply.error || 'unknown'}`;
+    // Hold the result on screen long enough to read before the poll resumes.
+    setTimeout(() => { _testingCaptcha = false; fetchStatus(); }, 6000);
+  });
 });
 
 document.getElementById('btn-toggle').addEventListener('click', () => {
@@ -93,3 +145,8 @@ document.getElementById('btn-toggle').addEventListener('click', () => {
     fetchStatus();
   });
 });
+
+// The version people read has to be the version that is loaded; keeping a
+// second copy in the markup is how it went stale.
+document.getElementById('header-version').textContent =
+  `v${chrome.runtime.getManifest().version}`;

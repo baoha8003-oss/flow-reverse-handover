@@ -1,12 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Flowboard Bridge",
-  "version": "0.0.5",
-  "description": "Local bridge that proxies Flowboard agent requests to authenticated labs.google sessions.",
-  "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting", "declarativeNetRequest"],
+  "version": "0.3.0",
+  "description": "Local bridge for Google Flow: runs batchexecute RPCs inside your signed-in flow.google.com tab and mints the reCAPTCHA each one needs. Also proxies cookie-authenticated calls to Grok and Shopee.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "webRequest",
+    "scripting"
+  ],
   "host_permissions": [
-    "https://aisandbox-pa.googleapis.com/*",
+    "https://flow.google.com/*",
     "https://labs.google/*",
+    "https://grok.com/*",
+    "https://shopee.vn/*",
     "http://127.0.0.1:8101/*",
     "http://localhost:8101/*"
   ],
@@ -21,25 +29,41 @@
     {
       "matches": [
         "https://labs.google/fx/tools/flow*",
-        "https://labs.google/fx/*/tools/flow*"
+        "https://labs.google/fx/*/tools/flow*",
+        "https://flow.google.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://grok.com/*"
+      ],
+      "js": [
+        "content-grok.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
-      "matches": ["https://labs.google/*"]
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "https://labs.google/*",
+        "https://flow.google.com/*"
+      ]
+    },
+    {
+      "resources": [
+        "injected-grok.js"
+      ],
+      "matches": [
+        "https://grok.com/*"
+      ]
     }
-  ],
-  "declarative_net_request": {
-    "rule_resources": [
-      {
-        "id": "flowboard_rules",
-        "enabled": true,
-        "path": "rules.json"
-      }
-    ]
-  }
+  ]
 }
